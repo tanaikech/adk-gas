@@ -525,6 +525,6 @@ function createServerContext_() {
   - Initial release.
 
 - v1.0.2 (May 18, 2026)
-  - Modified.
+  - Modified. Updated `.gitignore`
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)
