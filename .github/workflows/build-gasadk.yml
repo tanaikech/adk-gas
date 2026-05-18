@@ -1,0 +1,101 @@
+name: Build and Deploy GASADK
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    paths:
+      - "src/LlmAgent.js"
+  workflow_dispatch:
+
+env:
+  # Force GitHub Actions to use Node.js 24 to suppress the deprecation warning
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Aggregate files and generate GASADK.js
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          node -e "
+          const fs = require('fs');
+
+          async function main() {
+            const files = [
+              // Local file is read directly from the filesystem (already checked out)
+              { type: 'local', path: 'src/LlmAgent.js' },
+              // External files are fetched via HTTPS
+              { type: 'remote', url: 'https://raw.githubusercontent.com/tanaikech/GeminiWithFiles/master/classGeminiWithFiles.js' },
+              { type: 'remote', url: 'https://raw.githubusercontent.com/tanaikech/A2AApp/master/A2AApp.js' },
+              { type: 'remote', url: 'https://raw.githubusercontent.com/tanaikech/MCPApp/master/MCPApp.js' },
+              { type: 'remote', url: 'https://raw.githubusercontent.com/tanaikech/MCPA2Aserver-GAS-Library/master/classMCPA2Aserver/classMCPA2Aserver.js' },
+              { type: 'remote', url: 'https://raw.githubusercontent.com/tanaikech/FileSearchApp/master/FileSearchApp.js' }
+            ];
+
+            const pat = process.env.PAT_TOKEN;
+            const headers = pat ? { 'Authorization': \`token \${pat}\` } : {};
+
+            try {
+              const contents = [];
+              for (const file of files) {
+                if (file.type === 'local') {
+                  console.log('Reading local file: ' + file.path);
+                  if (!fs.existsSync(file.path)) {
+                    throw new Error(\`Local file not found: \${file.path}\`);
+                  }
+                  const content = fs.readFileSync(file.path, 'utf8');
+                  contents.push(content.trimEnd());
+                } else {
+                  console.log('Downloading remote file: ' + file.url);
+                  const response = await fetch(file.url, { headers });
+                  if (!response.ok) {
+                    throw new Error(\`Failed to fetch \${file.url}: \${response.status} \${response.statusText}\`);
+                  }
+                  const content = await response.text();
+                  contents.push(content.trimEnd());
+                }
+              }
+
+              // Join with exactly 3 newlines (\n\n\n) to guarantee exactly 2 empty lines between contents
+              const finalContent = contents.join('\n\n\n') + '\n';
+              
+              fs.mkdirSync('dist', { recursive: true });
+              fs.writeFileSync('dist/GASADK.js', finalContent);
+              console.log('Successfully generated dist/GASADK.js');
+            } catch (error) {
+              console.error('Fatal error during file aggregation:', error);
+              process.exit(1);
+            }
+          }
+
+          main();
+          "
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dist/GASADK.js
+
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: auto-generate GASADK.js based on LlmAgent.js update"
+            git push
+          else
+            echo "No changes detected in the generated GASADK.js file. Skipping commit."
+          fi
