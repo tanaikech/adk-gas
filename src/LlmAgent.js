@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v1.0.0] - The Ultimate Autonomous Orchestrator
+ * [Production Release v1.1.0] - The Ultimate Autonomous Orchestrator
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -25,7 +25,11 @@
  *   name: "OrchestratorPrime",
  *   maxReplans: 2,
  *   timeoutMs: 280000,
- *   maxResultLength: 20000
+ *   maxResultLength: 20000,
+ *   mcpServers: [
+ *     "https://basic.mcp.example.com",
+ *     { "secure-server": { "httpUrl": "https://secure.mcp.example.com", "headers": { "X-Api-Key": "key" } } }
+ *   ]
  * });
  * agent.setServices({ lock: LockService.getScriptLock() });
  * const result = agent.run("What is the exchange rate between USD and GBP?");
@@ -168,7 +172,7 @@ var LlmAgent = class LlmAgent {
 
         if (initClient?.mcpServerObj?.length > 0) {
           initClient.mcpServerObj.forEach((obj, idx) => {
-            const url = this.mcpServers[idx];
+            const originalUrlOrObj = obj.original || this.mcpServers[idx];
             const sInfo = obj.initialize?.result?.serverInfo || {
               name: `MCPServer_${idx}`,
               version: "unknown",
@@ -187,6 +191,7 @@ var LlmAgent = class LlmAgent {
               description: t.description,
               required_parameters: t.inputSchema?.required || [],
             }));
+
             this.capabilities.push({
               id: `mcp_${idx}`,
               type: "MCP Server",
@@ -196,7 +201,7 @@ var LlmAgent = class LlmAgent {
                 version: sInfo.version,
                 tools: toolDescriptions,
               },
-              URL: url,
+              URL: originalUrlOrObj,
             });
           });
         }

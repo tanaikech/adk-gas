@@ -527,4 +527,9 @@ function createServerContext_() {
 - v1.0.2 (May 18, 2026)
   - Modified. Updated `.gitignore`
 
+- v1.1.0 (May 19, 2026)
+  - MCPApp and A2AApp were updated to support custom headers for authenticated connections.
+  - LlmAgent was updated to integrate these changes, allowing seamless interaction with secure MCP servers and remote agents.
+  - Added support for structured object input (URL and headers) in `mcpServers` and `agentCardUrls`.
+
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)

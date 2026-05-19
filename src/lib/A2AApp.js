@@ -16,6 +16,24 @@ const toLog_ = (kind, text) => {
  * Class object for A2AApp.
  * This is used for building both an Agent2Agent (A2A) server and an A2A client with Google Apps Script.
  *
+ * ### Usage Example
+ * ```javascript
+ * const agentCardUrls = [
+ *   "https://public.agent.com",
+ *   { "secure-agent": { "httpUrl": "https://secure.agent.com", "headers": { "X-Agent-Key": "my-secret" } } }
+ * ];
+ *
+ * const app = new A2AApp({ model: "models/gemini-3-flash-preview" });
+ * app.setServices({ lock: LockService.getScriptLock() });
+ *
+ * const response = app.client({
+ *   apiKey: "YOUR_GEMINI_API_KEY",
+ *   prompt: "Ask the secure agent about the current server status.",
+ *   agentCardUrls: agentCardUrls
+ * });
+ * console.log(response.result);
+ * ```
+ *
  * ### Important Note
  * If this script is used as a server (Web App), you MUST create a "New Deployment"
  * after updating the code. Otherwise, the old cached script will be executed.
@@ -30,7 +48,8 @@ const toLog_ = (kind, text) => {
  * - [Phase 7: Final Synthesis] Generating the ultimate summarized response.
  *
  * Author: Kanshi Tanaike
- * Version: 2.2.2
+ * Refactored by: Senior Generative AI & MCP Expert
+ * Version: 2.3.0
  * GitHub: https://github.com/tanaikech/A2AApp
  * @class
  */
@@ -130,8 +149,8 @@ var A2AApp = class A2AApp {
    * Set services dependent on each script.
    *
    * @param {Object} services Object containing services.
-   * @param {LockService.Lock} services.lock Lock service instance.
-   * @param {PropertiesService.Properties} services.properties Properties service instance.
+   * @param {GoogleAppsScript.Lock.Lock} services.lock Lock service instance.
+   * @param {GoogleAppsScript.Properties.Properties} services.properties Properties service instance.
    * @return {A2AApp}
    */
   setServices(services) {
@@ -153,7 +172,7 @@ var A2AApp = class A2AApp {
    * @param {String} object.apiKey API key for Gemini.
    * @param {Function} object.agentCard Getter function for agent card object.
    * @param {Function} object.functions Getter function for functions object.
-   * @return {ContentService.TextOutput}
+   * @return {GoogleAppsScript.Content.TextOutput}
    */
   server(object = {}) {
     this.contextType = "server";
@@ -582,7 +601,7 @@ var A2AApp = class A2AApp {
 
   /**
    * [Phase 3: Tool Proxying] Prepare client-side functions inclusive of remote agents.
-   * Incorporates detailed logging wrappers for introspection.
+   * Incorporates detailed logging wrappers for introspection and injects custom headers for authenticated routing.
    * @private
    */
   getClientFunctions_(agentCards, addedFunctions) {
@@ -630,113 +649,121 @@ var A2AApp = class A2AApp {
 
     // Integrate Discovered AI agents via dynamic schema proxying
     if (agentCards.length > 0) {
-      agentCards.forEach(({ name, description, url, provider, skills }) => {
-        // Add 'customType_' prefix to intentionally bypass GeminiWithFiles automatic loop execution.
-        const safeName = "customType_" + name.replace(/ /g, "_");
-        const skillStr = skills
-          .map((o) => {
-            const name = o.name || "no name";
-            const description = o.description || "no description";
-            const examples =
-              o.examples && o.examples.length > 0
-                ? o.examples.join(", ")
-                : "no examples";
+      agentCards.forEach(
+        ({ name, description, url, provider, skills, customHeaders = {} }) => {
+          // Add 'customType_' prefix to intentionally bypass GeminiWithFiles automatic loop execution.
+          const safeName = "customType_" + name.replace(/ /g, "_");
+          const skillStr = skills
+            .map((o) => {
+              const name = o.name || "no name";
+              const description = o.description || "no description";
+              const examples =
+                o.examples && o.examples.length > 0
+                  ? o.examples.join(", ")
+                  : "no examples";
 
-            return `id: ${o.id}, name: ${name}, description: ${description}, examples: ${examples}`;
-          })
-          .join(" | ");
+              return `id: ${o.id}, name: ${name}, description: ${description}, examples: ${examples}`;
+            })
+            .join(" | ");
 
-        funcs.params_[safeName] = {
-          description: [
-            `Agent name: ${safeName}`,
-            `Description: ${description}`,
-            `URL: ${url}`,
-            `Skills: ${skillStr}`,
-            provider
-              ? `Provider: ${provider.organization}, ${provider.url}`
-              : "",
-          ]
-            .filter(Boolean)
-            .join("\n"),
-          parameters: {
-            type: "object",
-            properties: {
-              agent_name: {
-                type: "string",
-                description: "Agent name you selected.",
-              },
-              agent_url: { type: "string", description: "URL of the agent." },
-              task: {
-                type: "string",
-                description:
-                  "Details of task. Give the suitable task to this agent.",
-              },
-            },
-            required: ["agent_name", "agent_url", "task"],
-          },
-        };
-
-        // Define proxy facade to safely remote trigger specific capabilities
-        funcs[safeName] = (args) => {
-          const { agent_name, agent_url, task } = args;
-          const msgCall = `Agent Call proxy invoked: "${agent_name}" | Assigned Task: "${task}" | URL: ${agent_url}`;
-          console.log(`[Phase 5: Sequential Execution] ${msgCall}`);
-          this.addLog_(
-            new Date(),
-            "[Phase 5: Sequential Execution]",
-            null,
-            `${this.contextType} internal`,
-            msgCall,
-          );
-
-          const id1 = Utilities.newBlob(new Date().getTime().toString())
-            .getBytes()
-            .map((byte) => ("0" + (byte & 0xff).toString(16)).slice(-2))
-            .join("");
-          const id2 = Utilities.getUuid();
-          const id3 = Utilities.getUuid();
-
-          const resObj = {
-            jsonrpc: this.jsonrpc,
-            id: id1,
-            method: "tasks/send",
-            params: {
-              id: id2,
-              sessionId: id3,
-              message: { role: "user", parts: [{ type: "text", text: task }] },
-              acceptedOutputModes: ["text", "text/plain"],
-            },
-          };
-
-          this.addLog_(
-            new Date(),
-            "[Phase 5: Sequential Execution]",
-            null,
-            "client --> server",
-            `JSON-RPC Payload created: ${JSON.stringify(resObj)}`,
-          );
-
-          // Wrap response in 'items' pattern to enforce the immediate bypass strategy
-          // and forcefully specify 'method' and 'contentType' to avoid invalid generic GET requests.
-          return {
-            items: {
-              functionResponse: {
-                request: {
-                  url: agent_url,
-                  method: "post",
-                  contentType: "application/json",
-                  payload: JSON.stringify(resObj),
-                  headers: this.headers,
-                  muteHttpExceptions: true,
+          funcs.params_[safeName] = {
+            description: [
+              `Agent name: ${safeName}`,
+              `Description: ${description}`,
+              `URL: ${url}`,
+              `Skills: ${skillStr}`,
+              provider
+                ? `Provider: ${provider.organization}, ${provider.url}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+            parameters: {
+              type: "object",
+              properties: {
+                agent_name: {
+                  type: "string",
+                  description: "Agent name you selected.",
                 },
-                resObj,
-                name: safeName,
-                argsObj: args,
+                agent_url: { type: "string", description: "URL of the agent." },
+                task: {
+                  type: "string",
+                  description:
+                    "Details of task. Give the suitable task to this agent.",
+                },
               },
+              required: ["agent_name", "agent_url", "task"],
             },
           };
-        };
-      });
+
+          // Define proxy facade to safely remote trigger specific capabilities
+          funcs[safeName] = (args) => {
+            const { agent_name, agent_url, task } = args;
+            const msgCall = `Agent Call proxy invoked: "${agent_name}" | Assigned Task: "${task}" | URL: ${agent_url}`;
+            console.log(`[Phase 5: Sequential Execution] ${msgCall}`);
+            this.addLog_(
+              new Date(),
+              "[Phase 5: Sequential Execution]",
+              null,
+              `${this.contextType} internal`,
+              msgCall,
+            );
+
+            const id1 = Utilities.newBlob(new Date().getTime().toString())
+              .getBytes()
+              .map((byte) => ("0" + (byte & 0xff).toString(16)).slice(-2))
+              .join("");
+            const id2 = Utilities.getUuid();
+            const id3 = Utilities.getUuid();
+
+            const resObj = {
+              jsonrpc: this.jsonrpc,
+              id: id1,
+              method: "tasks/send",
+              params: {
+                id: id2,
+                sessionId: id3,
+                message: {
+                  role: "user",
+                  parts: [{ type: "text", text: task }],
+                },
+                acceptedOutputModes: ["text", "text/plain"],
+              },
+            };
+
+            this.addLog_(
+              new Date(),
+              "[Phase 5: Sequential Execution]",
+              null,
+              "client --> server",
+              `JSON-RPC Payload created: ${JSON.stringify(resObj)}`,
+            );
+
+            // Apply specific custom headers dynamically extracted from the normalization sequence
+            const combinedHeaders = { ...this.headers, ...customHeaders };
+
+            // Wrap response in 'items' pattern to enforce the immediate bypass strategy
+            // and forcefully specify 'method' and 'contentType' to avoid invalid generic GET requests.
+            return {
+              items: {
+                functionResponse: {
+                  request: {
+                    url: agent_url,
+                    method: "post",
+                    contentType: "application/json",
+                    payload: JSON.stringify(resObj),
+                    headers: combinedHeaders,
+                    muteHttpExceptions: true,
+                  },
+                  resObj,
+                  name: safeName,
+                  argsObj: args,
+                },
+              },
+            };
+          };
+        },
+      );
     }
 
     // Merge User's custom defined implementations with interceptors for granular logging
@@ -802,33 +829,62 @@ var A2AApp = class A2AApp {
 
   /**
    * [Phase 2: Agent Discovery] Retrieve and parse agent cards optimally from given URLs.
-   * @param {Array<String>} agentCardUrls Array of strings referring to remote card sources.
+   * Handles string URLs as well as structured objects encapsulating custom headers.
+   * @param {Array<String|Object>} agentCardUrls Array of strings or objects referring to remote card sources.
    * @return {Array<Object>} Array of sanitized agent card objects.
    */
   getAgentCards(agentCardUrls) {
     const phaseTag = "[Phase 2: Agent Discovery]";
     console.log(`${phaseTag} Initiating agent card retrieval.`);
-    this.addLog_(
-      new Date(),
-      phaseTag,
-      null,
-      `${this.contextType} internal`,
-      `Target URLs: ${agentCardUrls.join(", ")}`,
-    );
 
     if (!agentCardUrls || agentCardUrls.length === 0) {
       console.warn(`${phaseTag} No agent cards URLs provided.`);
       return [];
     }
 
-    const requests = agentCardUrls.map((u) => {
-      const { url, queryParameters } = this.parseQueryParameters_(u);
+    // Normalize inputs separating clean string paths and embedded object configurations
+    const normalizedUrls = agentCardUrls
+      .map((item) => {
+        if (typeof item === "string" && item.trim() !== "") {
+          return { url: item.trim(), headers: {}, original: item };
+        } else if (typeof item === "object" && item !== null) {
+          const key = Object.keys(item)[0];
+          const val = item[key];
+          if (val && val.httpUrl) {
+            return {
+              url: val.httpUrl.trim(),
+              headers: val.headers || {},
+              original: item,
+            };
+          }
+        }
+        return null;
+      })
+      .filter(Boolean);
+
+    if (normalizedUrls.length === 0) {
+      console.warn(`${phaseTag} No valid agent cards configurations parsed.`);
+      return [];
+    }
+
+    this.addLog_(
+      new Date(),
+      phaseTag,
+      null,
+      `${this.contextType} internal`,
+      `Target URLs Processed: ${normalizedUrls.length}`,
+    );
+
+    const requests = normalizedUrls.map((norm) => {
+      const { url, queryParameters } = this.parseQueryParameters_(norm.url);
       const path = url.split("/").pop();
       const targetUrl = ["exec", "dev"].includes(path)
         ? `${url.trim()}/.well-known/agent-card.json`
         : url.trim();
 
-      // Log outgoing request intention
+      // Merge native authentication scopes with the provided dynamic context headers
+      const combinedHeaders = { ...this.headers, ...norm.headers };
+
       this.addLog_(
         new Date(),
         phaseTag,
@@ -839,7 +895,7 @@ var A2AApp = class A2AApp {
 
       return {
         url: this.addQueryParameters_(targetUrl, queryParameters || {}),
-        headers: this.headers,
+        headers: combinedHeaders,
         muteHttpExceptions: true,
       };
     });
@@ -849,7 +905,9 @@ var A2AApp = class A2AApp {
       if (res.getResponseCode() === 200) {
         try {
           const o = JSON.parse(res.getContentText());
-          o.url = o.url || agentCardUrls[i];
+          o.url = o.url || normalizedUrls[i].url;
+          o.customHeaders = normalizedUrls[i].headers; // Inject mapping context downstream
+
           if (o.name) {
             o.name = o.name.replace(/ /g, "_");
           }
@@ -863,12 +921,12 @@ var A2AApp = class A2AApp {
           );
         } catch (e) {
           console.warn(
-            `${phaseTag} Failed to parse agent card from "${agentCardUrls[i]}".`,
+            `${phaseTag} Failed to parse agent card from "${normalizedUrls[i].url}".`,
           );
         }
       } else {
         console.warn(
-          `${phaseTag} Didn't get agent card from "${agentCardUrls[i]}". HTTP Status: ${res.getResponseCode()}`,
+          `${phaseTag} Didn't get agent card from "${normalizedUrls[i].url}". HTTP Status: ${res.getResponseCode()}`,
         );
       }
       return acc;
@@ -1383,7 +1441,7 @@ var A2AApp = class A2AApp {
   }
 
   /**
-   * Helper: Map JSON definitions as parameter endpoints appending uniformly.
+   * Helper: Map JSON definitions as parameter endpoints uniformly.
    * @private
    */
   addQueryParameters_(url, obj) {
