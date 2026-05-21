@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v1.1.0] - The Ultimate Autonomous Orchestrator
+ * [Production Release v1.2.0] - The Ultimate Autonomous Orchestrator with Chat History
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -18,21 +18,24 @@
  *   the current DAG queue and dynamically regenerates an alternative execution plan to achieve the goal.
  * - **Temporal Context Anchoring**: Injects the exact system time into the global context,
  *   completely resolving 'Planner Context Blindness' for relative temporal queries (e.g., "tomorrow").
+ * - **Seamless Chat Context**: Maintains and propagates conversation history dynamically to
+ *   sub-agents, MCP servers, and A2A remote servers without polluting the core logic history.
  *
  * @usage
  * const agent = new LlmAgent({
  *   apiKey: "YOUR_GEMINI_API_KEY",
  *   name: "OrchestratorPrime",
- *   maxReplans: 2,
- *   timeoutMs: 280000,
- *   maxResultLength: 20000,
- *   mcpServers: [
- *     "https://basic.mcp.example.com",
- *     { "secure-server": { "httpUrl": "https://secure.mcp.example.com", "headers": { "X-Api-Key": "key" } } }
- *   ]
+ *   mcpServers: ["https://basic.mcp.example.com"]
  * });
  * agent.setServices({ lock: LockService.getScriptLock() });
- * const result = agent.run("What is the exchange rate between USD and GBP?");
+ *
+ * // --- Chat History Example ---
+ * agent.setHistory([
+ *   { role: "user", parts: [{ text: "Hello, my project code is XRAY-7." }] },
+ *   { role: "model", parts: [{ text: "I have recorded your project code as XRAY-7." }] }
+ * ]);
+ * const result = agent.run("What is my project code?");
+ * console.log(agent.getHistory());
  */
 var LlmAgent = class LlmAgent {
   constructor(config = {}) {
@@ -83,6 +86,33 @@ var LlmAgent = class LlmAgent {
     this.services = services;
     this._initializeCapabilities();
     return this;
+  }
+
+  /**
+   * Sets the conversation history for the agent.
+   * This allows the agent to maintain context across multiple interactions in a chat environment.
+   * The history format is fully compatible with GeminiWithFiles.
+   *
+   * @param {Array<Object>} history - An array of history objects containing 'role' and 'parts'.
+   * @returns {LlmAgent} This agent instance for chaining.
+   */
+  setHistory(history) {
+    if (!Array.isArray(history)) {
+      throw new Error(
+        "CRITICAL: History must be an array of objects compatible with GeminiWithFiles.",
+      );
+    }
+    this.history = history;
+    return this;
+  }
+
+  /**
+   * Retrieves the current conversation history.
+   *
+   * @returns {Array<Object>} The current history array.
+   */
+  getHistory() {
+    return this.history;
   }
 
   _requireLockService() {
@@ -337,7 +367,11 @@ var LlmAgent = class LlmAgent {
 
   _executeTask(cap, executionPrompt) {
     if (!cap) {
-      const g = new GeminiWithFiles({ apiKey: this.apiKey, model: this.model });
+      const g = new GeminiWithFiles({
+        apiKey: this.apiKey,
+        model: this.model,
+        history: [...this.history],
+      });
       return g.generateContent({ q: executionPrompt });
     }
 
@@ -356,6 +390,7 @@ var LlmAgent = class LlmAgent {
           apiKey: this.apiKey,
           model: this.model,
           functions: funcs,
+          history: [...this.history],
         });
         return g.generateContent({ q: executionPrompt });
       }
@@ -366,7 +401,7 @@ var LlmAgent = class LlmAgent {
           prompt: executionPrompt,
           mcpServerUrls: [cap.URL],
           batchProcess: true,
-          history: [],
+          history: [...this.history],
         });
         const res = tempClient.callMCPServers();
         if (res?.error)
@@ -379,13 +414,16 @@ var LlmAgent = class LlmAgent {
           apiKey: this.apiKey,
           prompt: executionPrompt,
           agentCards: [cap._card],
-          history: [],
+          history: [...this.history],
         });
         if (res?.error)
           throw new Error(`A2A Error: ${JSON.stringify(res.error)}`);
         return res?.result || res;
       }
       case "SubAgent":
+        if (typeof cap._agent.setHistory === "function") {
+          cap._agent.setHistory([...this.history]);
+        }
         return cap._agent.run(executionPrompt);
       case "Agent Skill": {
         const g = new GeminiWithFiles({
@@ -394,6 +432,7 @@ var LlmAgent = class LlmAgent {
           systemInstruction: {
             parts: [{ text: `Strictly apply this skill:\n\n${cap.content}` }],
           },
+          history: [...this.history],
         });
         return g.generateContent({ q: executionPrompt });
       }
@@ -402,6 +441,7 @@ var LlmAgent = class LlmAgent {
           apiKey: this.apiKey,
           model: this.model,
           tools: [cap._tool],
+          history: [...this.history],
         });
         return g.generateContent({ q: executionPrompt });
       }
@@ -1636,9 +1676,15 @@ const toLog_ = (kind, text) => {
  * const app = new A2AApp({ model: "models/gemini-3-flash-preview" });
  * app.setServices({ lock: LockService.getScriptLock() });
  * 
+ * // --- Chat History Example ---
+ * app.setHistory([
+ *   { role: "user", parts: [{ text: "Hello, remember that I like apples." }] },
+ *   { role: "model", parts: [{ text: "I will remember that you like apples." }] }
+ * ]);
+ * 
  * const response = app.client({
  *   apiKey: "YOUR_GEMINI_API_KEY",
- *   prompt: "Ask the secure agent about the current server status.",
+ *   prompt: "Ask the agent what my favorite fruit is.",
  *   agentCardUrls: agentCardUrls
  * });
  * console.log(response.result);
@@ -1655,11 +1701,11 @@ const toLog_ = (kind, text) => {
  * - [Phase 4: Planning] Gemini acts as a delegator to determine sequential routing.
  * - [Phase 5: Sequential Execution] Executing functions sequentially with forced routing.
  * - [Phase 6: Data Materialization] Isolating textual output from file blobs.
- * - [Phase 7: Final Synthesis] Generating the ultimate summarized response.
+ * - [Phase 7: Final Synthesis] Generating the ultimate summarized response and Clean History.
  *
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.3.0
+ * Version: 2.6.0 (Clean History Optimization)
  * GitHub: https://github.com/tanaikech/A2AApp
  * @class
  */
@@ -1694,6 +1740,9 @@ var A2AApp = class A2AApp {
 
     /** @private Context flag to dynamically adjust log direction values ("server" or "client") */
     this.contextType = "unknown";
+    
+    /** @private Chat history initialized array */
+    this.history = [];
 
     if (this.log) {
       const ss = spreadsheetId
@@ -1772,6 +1821,30 @@ var A2AApp = class A2AApp {
       this.properties = properties;
     }
     return this;
+  }
+
+  /**
+   * Sets the conversation history for the agent.
+   * This allows the agent to maintain context across multiple interactions in a chat environment.
+   *
+   * @param {Array<Object>} history - An array of history objects containing 'role' and 'parts'.
+   * @returns {A2AApp} This agent instance for chaining.
+   */
+  setHistory(history) {
+    if (!Array.isArray(history)) {
+      throw new Error("CRITICAL: History must be an array of objects compatible with GeminiWithFiles.");
+    }
+    this.history = history;
+    return this;
+  }
+
+  /**
+   * Retrieves the current conversation history.
+   *
+   * @returns {Array<Object>} The current history array.
+   */
+  getHistory() {
+    return this.history || [];
   }
 
   /**
@@ -1874,12 +1947,18 @@ var A2AApp = class A2AApp {
 
     try {
       // [Phase 2: Agent Discovery] Fetch Agent Cards
-      const { agentCardUrls = [], agentCards = [] } = object;
+      const { agentCardUrls = [], agentCards = [], history = this.history || [] } = object;
+      object.history = history;
       if (agentCards.length === 0 && agentCardUrls.length > 0) {
         object.agentCards = this.getAgentCards(agentCardUrls);
       }
 
       const res = this.processAgents_(object);
+      
+      // Safe History Updating
+      if (res && res.history) {
+        this.history = res.history; 
+      }
       this.log_();
       return res;
     } catch (err) {
@@ -2069,18 +2148,27 @@ var A2AApp = class A2AApp {
 
       try {
         const { params } = obj;
-        const { message } = params;
+        const { message, history: clientHistory = [] } = params;
         const prompt = message?.parts?.[0]?.text || "";
 
         // Trigger the internal orchestration logic on the server side
-        const { result, history } = this.processAgents_({
+        const orchestrationRes = this.processAgents_({
           apiKey,
           prompt,
+          history: clientHistory,
           functions: functions(),
           fileAsBlob: true,
           agentCards,
         });
 
+        // Guard against internal orchestration failures (e.g., LLM planning crash)
+        if (orchestrationRes.error) {
+          const errMsg = orchestrationRes.error.message || "Internal server orchestration error.";
+          console.error(`--- Server Process Error: ${errMsg}`);
+          return this.createErrorResponse_(errMsg, id, method);
+        }
+
+        const { result, history } = orchestrationRes;
         const artifacts = [];
         const messageParts = [];
 
@@ -2123,6 +2211,7 @@ var A2AApp = class A2AApp {
                   messageId: params.messageId,
                   parts: messageParts,
                   role: "agent",
+                  history: history, // Provide updated CLEAN history state back to client
                 },
                 id,
               }
@@ -2138,6 +2227,7 @@ var A2AApp = class A2AApp {
                     timestamp: new Date().toISOString(),
                   },
                   artifacts,
+                  history: history, // Provide updated CLEAN history state back to client
                 },
                 id,
               };
@@ -2214,7 +2304,7 @@ var A2AApp = class A2AApp {
    * Incorporates detailed logging wrappers for introspection and injects custom headers for authenticated routing.
    * @private
    */
-  getClientFunctions_(agentCards, addedFunctions) {
+  getClientFunctions_(agentCards, addedFunctions, history = []) {
     const phaseTag = "[Phase 3: Tool Proxying]";
     console.log(`${phaseTag} Initiated capabilities mapping.`);
     this.addLog_(
@@ -2334,6 +2424,7 @@ var A2AApp = class A2AApp {
               sessionId: id3,
               message: { role: "user", parts: [{ type: "text", text: task }] },
               acceptedOutputModes: ["text", "text/plain"],
+              history: history, // Injects context state natively into remote protocol requests
             },
           };
 
@@ -2559,6 +2650,7 @@ var A2AApp = class A2AApp {
     const createdFunctions = this.getClientFunctions_(
       agentCards,
       addedFunctions,
+      history
     );
 
     // [Phase 4: Planning]
@@ -2669,7 +2761,7 @@ var A2AApp = class A2AApp {
       const errObj = {
         error: {
           code: this.ErrorCode["Internal server error"],
-          message: "Internal server error. Try again.",
+          message: "Internal server error. Execution Order Generation Failed.",
         },
         jsonrpc: this.jsonrpc,
         id: null,
@@ -2957,7 +3049,6 @@ var A2AApp = class A2AApp {
           `${this.contextType} internal`,
           "Bypassing extra synthesis step due to singular text outcome.",
         );
-        g.history = tempHistory;
       } else {
         this.addLog_(
           new Date(),
@@ -2978,7 +3069,6 @@ var A2AApp = class A2AApp {
             { text: `<Answers>${strResults.join("\n")}</Answers>` },
           ],
         });
-        g.history = gg.history;
         finalResults = [
           res3,
           ...finalResults.filter((e) => typeof e !== "string"),
@@ -2992,7 +3082,6 @@ var A2AApp = class A2AApp {
         `${this.contextType} internal`,
         "No string components required synthesis.",
       );
-      g.history = tempHistory;
     }
 
     this.addLog_(
@@ -3006,7 +3095,29 @@ var A2AApp = class A2AApp {
     console.log(`${phase7Tag} Completed.`);
     forDebug && toLog_("finalResults2", JSON.stringify(finalResults));
 
-    return { result: finalResults, history: g.history, agentCards };
+    // [Refactoring: Clean History Construction]
+    // Eliminate massive internal intermediate LLM reasoning steps (functionCall, thoughtSignature, etc.) from the propagated history.
+    this.addLog_(
+      new Date(),
+      phase7Tag,
+      null,
+      `${this.contextType} internal`,
+      "Constructing clean history to prevent token bloat.",
+    );
+
+    const historyAnswerText = finalResults
+      .map((e) => (typeof e === "string" ? e : "[Binary Data]"))
+      .join("\n");
+
+    const cleanHistory = [...history];
+    if (prompt) {
+      cleanHistory.push({ role: "user", parts: [{ text: prompt }] });
+    }
+    if (historyAnswerText) {
+      cleanHistory.push({ role: "model", parts: [{ text: historyAnswerText }] });
+    }
+
+    return { result: finalResults, history: cleanHistory, agentCards };
   }
 
   /**
@@ -4743,10 +4854,11 @@ var MCPApp = class MCPApp {
 /**
  * MCPA2Aserver: Class Object for Consolidating Generative AI Protocols
  * Author: Tanaike
- * v2.0.0
+ * v2.1.0 (History-Aware Update)
  * GitHub: https://github.com/tanaikech/MCPA2Aserver-GAS-Library
  *
- * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking, and Detailed Documentation.
+ * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking, 
+ * and Seamless Server-Side Chat History Injection for A2A Protocols.
  *
  * ### Description
  * This class provides a consolidated server solution for Model Context Protocol (MCP) and Agent-to-Agent (A2A) communication directly within your Google Apps Script project.
@@ -4756,18 +4868,21 @@ var MCPApp = class MCPApp {
  *
  * #### 1. Initialization
  * Instantiate the class and inject the `LockService` from your Google Apps Script environment.
- * This is strictly required to prevent race conditions across concurrent webhook executions.
  * ```javascript
  * const mcpA2A = new MCPA2Aserver();
  * mcpA2A.setServices({ lock: LockService.getScriptLock() });
  * ```
  *
- * #### 2. Configuration
- * Configure your server credentials and optional logging parameters.
+ * #### 2. Configuration & History Injection (New)
+ * Configure your server credentials. You can now inject a "Base History" (e.g., System Persona or absolute facts) 
+ * that the remote A2A server will always prepend to the incoming client history.
  * ```javascript
- * mcpA2A.apiKey = "YOUR_GEMINI_API_KEY"; // Required for AI processing
- * mcpA2A.model = "models/gemini-3-flash-preview"; // Optional: Specify model
- * mcpA2A.logSpreadsheetId = "YOUR_SPREADSHEET_ID"; // Optional: Automatically creates 'MCPA2Aserver_log' sheet and tracks execution logs
+ * mcpA2A.apiKey = "YOUR_GEMINI_API_KEY";
+ * mcpA2A.model = "models/gemini-3-flash-preview";
+ * mcpA2A.setHistory([
+ *   { role: "user", parts: [{ text: "System Context: You are a financial expert." }] },
+ *   { role: "model", parts: [{ text: "Understood. I will act as a financial expert." }] }
+ * ]);
  * ```
  *
  * #### 3. Context Definition & Tool Routing
@@ -4778,32 +4893,18 @@ var MCPApp = class MCPApp {
  * - `type: undefined`: The tool is registered to BOTH servers automatically.
  *
  * #### 4. Manual Server Overrides (Optional)
- * By default, the server auto-detects which protocols to activate:
- * - If both `functions` and `agentCard` are provided -> A2A and MCP are both enabled.
- * - If only `functions` are provided -> MCP is enabled, A2A is disabled.
- *
- * You can bypass this auto-detection and force the server behavior using explicit boolean flags:
+ * You can bypass auto-detection and force the server behavior using explicit boolean flags:
  * ```javascript
  * mcpA2A.a2a = true;  // Force A2A server activation
  * mcpA2A.mcp = false; // Force MCP server deactivation
  * ```
  *
  * #### 5. Execution
- * Execute the main dispatcher within your `doGet` or `doPost` functions. You can supply a real-time callback function to monitor logs immediately.
+ * Execute the main dispatcher within your `doGet` or `doPost` functions.
  * ```javascript
- * const logCallback = (log) => {
- *   console.log(`[${log.direction}] ${log.level}: ${log.message}`);
- * };
  * const response = mcpA2A.main(e, context, logCallback);
- * return response; // Ensure you return the ContentService response to the client
+ * return response;
  * ```
- *
- * #### 6. Log Structure & Observability
- * If `logSpreadsheetId` is set, logs are batch-written to the Google Sheet.
- * Every log entry includes an Execution ID (UUID) and a `Direction` attribute to easily trace lifecycles:
- * - `Client -> Server`: Records the incoming HTTP method, path, and JSON payload.
- * - `Internal`: Records server routing logic, parsing decisions, and errors.
- * - `Server -> Client`: Records the exact outgoing JSON-RPC or text response payload sent back to the requester.
  */
 var MCPA2Aserver = class MCPA2Aserver {
   /**
@@ -4836,6 +4937,9 @@ var MCPA2Aserver = class MCPA2Aserver {
 
     /** @type {GoogleAppsScript.Lock.Lock|null} LockService instance injected from the executing environment. */
     this.lock = null;
+
+    /** @type {Array<Object>} Base history array for A2A context injection. */
+    this.history = [];
 
     /** @private @type {Array<Object>} Internal log storage */
     this.logs = [];
@@ -4885,6 +4989,30 @@ var MCPA2Aserver = class MCPA2Aserver {
   }
 
   /**
+   * Sets the base conversation history for the server.
+   * This history will be prepended to the client's history during A2A execution.
+   *
+   * @param {Array<Object>} history - An array of history objects containing 'role' and 'parts'.
+   * @returns {MCPA2Aserver} This instance for chaining.
+   */
+  setHistory(history) {
+    if (!Array.isArray(history)) {
+      throw new Error("CRITICAL: History must be an array of objects compatible with GeminiWithFiles.");
+    }
+    this.history = history;
+    return this;
+  }
+
+  /**
+   * Retrieves the current base conversation history configured on the server.
+   *
+   * @returns {Array<Object>} The current base history array.
+   */
+  getHistory() {
+    return this.history;
+  }
+
+  /**
    * Main Dispatcher Method
    * Analyzes context, routes the request, and flushes execution logs to the specified Google Sheet.
    *
@@ -4900,7 +5028,6 @@ var MCPA2Aserver = class MCPA2Aserver {
 
     this.addLog_("Main dispatcher initiated.", "INFO", "Internal");
 
-    // Extract and log the incoming client request payload
     const incomingReqInfo = this.extractRequestInfo_(e);
     this.addLog_(
       `Incoming Request: ${incomingReqInfo}`,
@@ -4949,18 +5076,35 @@ var MCPA2Aserver = class MCPA2Aserver {
       const route = this.determineRoute_(e);
       this.addLog_(`Route determined as: ${route.type}`, "INFO", "Internal");
 
+      let targetEvent = e;
+
       if (
         route.type === "A2A" &&
         this.a2a === true &&
         processedServers.processedA2AObj
       ) {
-        response = this.handleA2ARequest_(e, processedServers.processedA2AObj);
+        // Safe History Injection for A2A payloads
+        if (this.history && this.history.length > 0 && e.postData && e.postData.contents) {
+          try {
+            const postObj = JSON.parse(e.postData.contents);
+            if (postObj.params && (postObj.method === "message/send" || postObj.method === "tasks/send")) {
+              postObj.params.history = [...this.history, ...(postObj.params.history || [])];
+              targetEvent = this.cloneEvent_(e);
+              targetEvent.postData.contents = JSON.stringify(postObj);
+              this.addLog_(`Injected ${this.history.length} base history elements into incoming A2A payload.`, "INFO", "Internal");
+            }
+          } catch(err) {
+            this.addLog_(`Failed to inject history into payload: ${err.message}`, "WARN", "Internal");
+          }
+        }
+        response = this.handleA2ARequest_(targetEvent, processedServers.processedA2AObj);
       } else if (
         route.type === "MCP" &&
         this.mcp === true &&
         processedServers.processedMCPObj
       ) {
-        response = this.handleMCPRequest_(e, processedServers.processedMCPObj);
+        // MCP protocol is purely functional and operates without chat history context.
+        response = this.handleMCPRequest_(targetEvent, processedServers.processedMCPObj);
       } else {
         this.addLog_(
           `Unhandled routing or disabled server. Route Type: ${route.type}, A2A Enabled: ${this.a2a}, MCP Enabled: ${this.mcp}`,
@@ -4980,7 +5124,6 @@ var MCPA2Aserver = class MCPA2Aserver {
 
     this.addLog_("Execution completed.", "INFO", "Internal");
 
-    // Extract and log the outgoing server response payload
     const outgoingResInfo =
       response && typeof response.getContent === "function"
         ? response.getContent()
@@ -4994,6 +5137,32 @@ var MCPA2Aserver = class MCPA2Aserver {
     this.flushLogsToSheet_();
 
     return response;
+  }
+
+  /**
+   * Safely clones the Google Apps Script Event Object to allow payload mutations.
+   * GAS Event Objects are often read-only or contain prototype getters that fail standard destructuring.
+   *
+   * @private
+   * @param {EventObject} e
+   * @return {Object} Cloned Event Object
+   */
+  cloneEvent_(e) {
+    if (!e) return e;
+    return {
+      queryString: e.queryString,
+      parameter: e.parameter,
+      parameters: e.parameters,
+      contextPath: e.contextPath,
+      contentLength: e.contentLength,
+      pathInfo: e.pathInfo,
+      postData: e.postData ? {
+        length: e.postData.length,
+        type: e.postData.type,
+        contents: e.postData.contents,
+        name: e.postData.name
+      } : null
+    };
   }
 
   /**

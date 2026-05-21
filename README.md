@@ -24,6 +24,10 @@ At the core of GASADK is the **LlmAgent**, powered by the **Planner-Executor-Syn
    When external servers or massive Google Drive files return tens of thousands of characters, feeding them directly into the context window triggers a fatal `400 Payload Too Large` error. GASADK enforces a strict `maxResultLength` threshold (default 20,000 chars), automatically truncating overflow data. It favors partial data over catastrophic runtime crashes.
 5. **Dynamic Re-Planning (Targeted ReAct)**
    Unlike standard ADKs that rely on a continuous ReAct loop for every step, GASADK plans an entire DAG upfront. Only if a node in the DAG execution fails does the system trigger a Re-Plan. It discards the unexecuted queue, analyzes the failure report, and generates an alternative DAG utilizing different tools.
+6. **Clean History Optimization (A2AApp v2.6.0)**
+   Maintains and propagates conversation history dynamically to sub-agents, MCP servers, and remote A2A servers without polluting the core logic history. Massive internal intermediate LLM reasoning steps (function calls, planning thoughts) are filtered out, constructing a clean user/model role-based chat history to prevent token bloat and quota exhaustion.
+7. **Fast-Track Halt Optimization**
+   Allows server functions to forcefully bypass the server-side LLM synthesis loop (by returning `_gemini_halt: true`). This prevents endless generative loops, eliminates unnecessary token usage, and guarantees instant response times for purely algorithmic/computational tool executions.
 
 ### GASADK vs. TS ADK (`@google/adk`) Paradigm Shift
 
@@ -228,6 +232,10 @@ The `new LlmAgent(config)` constructor accepts an extensive configuration object
   **Mandatory for safe execution.** Binds `LockService.getScriptLock()` and `PropertiesService` to the agent. Prevents catastrophic state corruption and race conditions when multiple webhooks execute concurrently.
 - `run(prompt, logCallback)`  
   Executes the orchestrator. Takes the user `prompt` and an optional `logCallback` function to emit real-time telemetry on DAG planning and execution. Returns the final synthesized string, or a strictly formatted JSON object if `outputSchema` was defined.
+- `setHistory(history)`  
+  Sets the conversation history for the agent, enabling multi-turn context retention across runs. The history must be an array of objects compatible with GeminiWithFiles.
+- `getHistory()`  
+  Retrieves the current conversation history.
 - `getAgentInf()`  
   An introspection tool that returns an array of all internally normalized capabilities (from Native tools, MCP, A2A, and Skills) bound to the agent.
 
@@ -453,6 +461,18 @@ function main(e) {
   m.apiKey = object.apiKey;
   m.model = object.model;
 
+  // Pre-configure server-side injected history (System Context/Persona)
+  m.setHistory([
+    {
+      role: "user",
+      parts: [{ text: "System Context Override: You are an elite financial API node named OMEGA-SERVER, located securely in Tokyo." }]
+    },
+    {
+      role: "model",
+      parts: [{ text: "Understood. My secret access code is OMEGA-99." }]
+    }
+  ]);
+
   // Force enablement of both server protocols
   m.a2a = true;
   m.mcp = true;
@@ -480,32 +500,99 @@ function createServerContext_() {
           required: ["currency_from", "currency_to", "currency_date"],
         },
       },
+      chat_and_identity: {
+        description: "Answer general conversation, identity, location, and secret code questions based on the chat history.",
+        parameters: {
+          type: "object",
+          properties: {
+            message: { type: "string", description: "The complete, detailed response message." }
+          },
+          required: ["message"]
+        }
+      }
     },
     get_exchange_rate: (args) => {
       // Internal execution logic here...
       const res = `Rate from ${args.currency_from} to ${args.currency_to} is 0.82.`;
 
-      // Dual protocol return routing
-      return {
+      const returnObj = {
         mcp: {
           jsonrpc: "2.0",
           result: { content: [{ type: "text", text: res }], isError: false },
         },
         a2a: { result: res },
       };
+
+      // [Fast-Track Halt Optimization]: Return immediately to bypass secondary LLM synthesis loops
+      return {
+        ...returnObj,
+        _gemini_halt: true,
+        items: { functionResponse: returnObj }
+      };
     },
+    chat_and_identity: (args) => {
+      const res = args.message || "I have processed your chat request.";
+      const returnObj = {
+        mcp: {
+          jsonrpc: "2.0",
+          result: { content: [{ type: "text", text: res }], isError: false },
+        },
+        a2a: { result: res },
+      };
+      return {
+        ...returnObj,
+        _gemini_halt: true,
+        items: { functionResponse: returnObj }
+      };
+    }
   };
 
   const agentCard = {
     name: "API Manager",
-    description: "Provide management for using various APIs.",
+    description: "Provide management for using various APIs and handle conversational queries.",
     url: WEB_APPS_URL + `?accessKey=${object.accessKey}`,
-    skills: [{ id: "get_exchange_rate", name: "Exchange Rate Tool" }],
+    skills: [
+      { id: "get_exchange_rate", name: "Exchange Rate Tool" },
+      { id: "chat_and_identity", name: "Chat and Identity" }
+    ],
   };
 
   return { functions, agentCard };
 }
 ```
+
+### 6. Chat History & Context Retention
+
+GASADK supports seamless multi-turn conversation tracking across the orchestrator, remote agents, and Consolidated servers.
+
+```javascript
+const { LlmAgent } = GASADK;
+
+function test_chat_history() {
+  const properties = PropertiesService.getScriptProperties();
+  const API_KEY = properties.getProperty("GEMINI_API_KEY");
+
+  const agent = new LlmAgent({
+    apiKey: API_KEY,
+    name: "ChattyAgent",
+    model: "models/gemini-3-flash-preview",
+  }).setServices({ lock: LockService.getScriptLock(), properties: properties });
+
+  // 1. Manually seed/restore conversation history
+  agent.setHistory([
+    { role: "user", parts: [{ text: "Hello, my project code is XRAY-7." }] },
+    { role: "model", parts: [{ text: "Acknowledged. I have recorded your project code as XRAY-7." }] }
+  ]);
+
+  // 2. Run query referencing the context
+  const response = agent.run("What is my project code?");
+  console.log("Response:", response); // Output will resolve using the history
+
+  // 3. Inspect updated history
+  console.log("Updated History:", JSON.stringify(agent.getHistory(), null, 2));
+}
+```
+
 
 ---
 
@@ -531,5 +618,11 @@ function createServerContext_() {
   - MCPApp and A2AApp were updated to support custom headers for authenticated connections.
   - LlmAgent was updated to integrate these changes, allowing seamless interaction with secure MCP servers and remote agents.
   - Added support for structured object input (URL and headers) in `mcpServers` and `agentCardUrls`.
+
+- v1.2.0 (May 21, 2026)
+  - Added full Chat History context retention across `LlmAgent`, `A2AApp`, and `MCPA2Aserver`.
+  - Introduced Clean History Optimization in `A2AApp` (v2.6.0) to filter intermediate LLM reasoning steps from conversation history, preventing token bloat.
+  - Implemented server-side History Injection and Event Object cloning in `MCPA2Aserver`.
+  - Introduced Fast-Track Halt Optimization (`_gemini_halt`) to bypass synthesis loops on explicit server functions.
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)

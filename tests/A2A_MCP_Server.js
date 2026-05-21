@@ -1,7 +1,7 @@
 /**
  * Script for Consolidating Generative AI Protocols: A Single Server Solution for MCP and A2A
  * Author: Tanaike
- * Refactored Version with Explicit Override Support
+ * Refactored Version with Explicit Override Support, Server-Side History Injection, & Fast-Track Halt Optimization
  */
 
 const { MCPA2Aserver } = GASADK;
@@ -54,14 +54,31 @@ function main(e) {
   m.model = object.model;
 
   // --- Manual Server Overrides ---
-  // Setting these to true/false forces the server configuration, bypassing automatic detection.
-  // E.g., setting m.a2a = true and m.mcp = false runs exclusively as an A2A Server.
-  // If omitted or set to null, the server intelligently detects configuration from 'context'.
   m.a2a = true;
   m.mcp = true;
 
   if (object.accessKey) m.accessKey = object.accessKey;
   if (object.logSpreadsheetId) m.logSpreadsheetId = object.logSpreadsheetId;
+
+  // --- Server-Side History Injection ---
+  m.setHistory([
+    {
+      role: "user",
+      parts: [
+        {
+          text: "System Context Override: You are an elite financial API node named OMEGA-SERVER, located securely in Tokyo.",
+        },
+      ],
+    },
+    {
+      role: "model",
+      parts: [
+        {
+          text: "Understood. I have internalized my persona as a Tokyo-based financial API node named OMEGA-SERVER. My secret access code is OMEGA-99.",
+        },
+      ],
+    },
+  ]);
 
   // Real-time logging callback function
   const logCallback = (log) => {
@@ -71,11 +88,6 @@ function main(e) {
   };
 
   const res = m.main(e, context, logCallback);
-
-  // Retrieve comprehensive logs post-execution
-  const allLogs = m.getLogs();
-  console.log("Execution Log Summary:", JSON.stringify(allLogs, null, 2));
-
   return res;
 }
 
@@ -97,21 +109,12 @@ function getAgentCard() {
 
 /**
  * Creates the base context containing definitions for the tools and the agent card.
- * The MCPA2Aserver class intrinsically segregates these items into A2A and MCP structures
- * based on the "type" property and the explicit server boolean flags.
- *
- * Tool Categorization Rules:
- * - type: "mcp" -> Exclusive to MCP.
- * - type: "a2a" -> Exclusive to A2A.
- * - type undefined -> Available in both.
- *
  * @returns {{ functions: Object, agentCard?: Object }} The unified context.
  */
 function createServerContext_() {
   const functions = {
     params_: {
       get_exchange_rate: {
-        // type: "a2a", // Explicitly bind to A2A, or "mcp", or leave undefined for both.
         description: "Use this to get current exchange rate.",
         parameters: {
           type: "object",
@@ -136,7 +139,6 @@ function createServerContext_() {
       },
 
       get_current_weather: {
-        // type: "mcp",
         description: [
           "Use this to get the weather using the latitude and the longitude.",
           "At that time, convert the location to the latitude and the longitude and provide them to the function.",
@@ -166,6 +168,22 @@ function createServerContext_() {
           required: ["latitude", "longitude", "date", "timezone"],
         },
       },
+
+      chat_and_identity: {
+        description:
+          "Answer general conversation, identity, location, and secret code questions based on the chat history.",
+        parameters: {
+          type: "object",
+          properties: {
+            message: {
+              type: "string",
+              description:
+                "The complete, detailed response message addressing all of the user's questions.",
+            },
+          },
+          required: ["message"],
+        },
+      },
     },
 
     get_exchange_rate: (object) => {
@@ -188,12 +206,20 @@ function createServerContext_() {
       } catch ({ stack }) {
         res = stack;
       }
-      return {
+
+      const returnObj = {
         mcp: {
           jsonrpc: "2.0",
           result: { content: [{ type: "text", text: res }], isError: false },
         },
         a2a: { result: res },
+      };
+
+      // [Optimization]: Forcefully bypass the server-side LLM synthesis loop to prevent hallucination and save tokens.
+      return {
+        ...returnObj,
+        _gemini_halt: true,
+        items: { functionResponse: returnObj },
       };
     },
 
@@ -258,12 +284,40 @@ function createServerContext_() {
       } catch ({ stack }) {
         res = stack;
       }
-      return {
+
+      const returnObj = {
         mcp: {
           jsonrpc: "2.0",
           result: { content: [{ type: "text", text: res }], isError: false },
         },
         a2a: { result: res },
+      };
+
+      // [Optimization]: Forcefully bypass the server-side LLM synthesis loop.
+      return {
+        ...returnObj,
+        _gemini_halt: true,
+        items: { functionResponse: returnObj },
+      };
+    },
+
+    chat_and_identity: (object) => {
+      console.log("Run the function chat_and_identity.");
+      const res = object.message || "I have processed your chat request.";
+
+      const returnObj = {
+        mcp: {
+          jsonrpc: "2.0",
+          result: { content: [{ type: "text", text: res }], isError: false },
+        },
+        a2a: { result: res },
+      };
+
+      // [Optimization]: Return immediately to the client to avoid endless generative loops and token bloat.
+      return {
+        ...returnObj,
+        _gemini_halt: true,
+        items: { functionResponse: returnObj },
       };
     },
   };
@@ -271,9 +325,10 @@ function createServerContext_() {
   const agentCard = {
     name: "API Manager",
     description: [
-      `Provide management for using various APIs.`,
-      `- Run with exchange values between various currencies. For example, this answers "What is the exchange rate between USD and GBP?".`,
-      `- Return the weather information by providing the location and the date, and the time.`,
+      `Provide management for using various APIs and handle conversational queries.`,
+      `- Run with exchange values between various currencies.`,
+      `- Return the weather information.`,
+      `- Answer questions about your own identity, location, access codes, and remember user details.`,
     ].join("\n"),
     provider: {
       organization: "Tanaike",
@@ -309,6 +364,16 @@ function createServerContext_() {
           "Return the weather in Tokyo for tomorrow's lunchtime.",
           "Return the weather in Tokyo for 9 AM on May 27, 2025.",
         ],
+        inputModes: ["text/plain"],
+        outputModes: ["text/plain"],
+      },
+      {
+        id: "chat_and_identity",
+        name: "Chat and Identity",
+        description:
+          "Can converse naturally about the user's name, the agent's location, secret codes, and general context.",
+        tags: ["chat", "identity"],
+        examples: ["What is my name?", "Where are you located?"],
         inputModes: ["text/plain"],
         outputModes: ["text/plain"],
       },

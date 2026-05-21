@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v1.1.0] - The Ultimate Autonomous Orchestrator
+ * [Production Release v1.2.0] - The Ultimate Autonomous Orchestrator with Chat History
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -18,21 +18,24 @@
  *   the current DAG queue and dynamically regenerates an alternative execution plan to achieve the goal.
  * - **Temporal Context Anchoring**: Injects the exact system time into the global context,
  *   completely resolving 'Planner Context Blindness' for relative temporal queries (e.g., "tomorrow").
+ * - **Seamless Chat Context**: Maintains and propagates conversation history dynamically to
+ *   sub-agents, MCP servers, and A2A remote servers without polluting the core logic history.
  *
  * @usage
  * const agent = new LlmAgent({
  *   apiKey: "YOUR_GEMINI_API_KEY",
  *   name: "OrchestratorPrime",
- *   maxReplans: 2,
- *   timeoutMs: 280000,
- *   maxResultLength: 20000,
- *   mcpServers: [
- *     "https://basic.mcp.example.com",
- *     { "secure-server": { "httpUrl": "https://secure.mcp.example.com", "headers": { "X-Api-Key": "key" } } }
- *   ]
+ *   mcpServers: ["https://basic.mcp.example.com"]
  * });
  * agent.setServices({ lock: LockService.getScriptLock() });
- * const result = agent.run("What is the exchange rate between USD and GBP?");
+ *
+ * // --- Chat History Example ---
+ * agent.setHistory([
+ *   { role: "user", parts: [{ text: "Hello, my project code is XRAY-7." }] },
+ *   { role: "model", parts: [{ text: "I have recorded your project code as XRAY-7." }] }
+ * ]);
+ * const result = agent.run("What is my project code?");
+ * console.log(agent.getHistory());
  */
 var LlmAgent = class LlmAgent {
   constructor(config = {}) {
@@ -83,6 +86,33 @@ var LlmAgent = class LlmAgent {
     this.services = services;
     this._initializeCapabilities();
     return this;
+  }
+
+  /**
+   * Sets the conversation history for the agent.
+   * This allows the agent to maintain context across multiple interactions in a chat environment.
+   * The history format is fully compatible with GeminiWithFiles.
+   *
+   * @param {Array<Object>} history - An array of history objects containing 'role' and 'parts'.
+   * @returns {LlmAgent} This agent instance for chaining.
+   */
+  setHistory(history) {
+    if (!Array.isArray(history)) {
+      throw new Error(
+        "CRITICAL: History must be an array of objects compatible with GeminiWithFiles.",
+      );
+    }
+    this.history = history;
+    return this;
+  }
+
+  /**
+   * Retrieves the current conversation history.
+   *
+   * @returns {Array<Object>} The current history array.
+   */
+  getHistory() {
+    return this.history;
   }
 
   _requireLockService() {
@@ -337,7 +367,11 @@ var LlmAgent = class LlmAgent {
 
   _executeTask(cap, executionPrompt) {
     if (!cap) {
-      const g = new GeminiWithFiles({ apiKey: this.apiKey, model: this.model });
+      const g = new GeminiWithFiles({
+        apiKey: this.apiKey,
+        model: this.model,
+        history: [...this.history],
+      });
       return g.generateContent({ q: executionPrompt });
     }
 
@@ -356,6 +390,7 @@ var LlmAgent = class LlmAgent {
           apiKey: this.apiKey,
           model: this.model,
           functions: funcs,
+          history: [...this.history],
         });
         return g.generateContent({ q: executionPrompt });
       }
@@ -366,7 +401,7 @@ var LlmAgent = class LlmAgent {
           prompt: executionPrompt,
           mcpServerUrls: [cap.URL],
           batchProcess: true,
-          history: [],
+          history: [...this.history],
         });
         const res = tempClient.callMCPServers();
         if (res?.error)
@@ -379,13 +414,16 @@ var LlmAgent = class LlmAgent {
           apiKey: this.apiKey,
           prompt: executionPrompt,
           agentCards: [cap._card],
-          history: [],
+          history: [...this.history],
         });
         if (res?.error)
           throw new Error(`A2A Error: ${JSON.stringify(res.error)}`);
         return res?.result || res;
       }
       case "SubAgent":
+        if (typeof cap._agent.setHistory === "function") {
+          cap._agent.setHistory([...this.history]);
+        }
         return cap._agent.run(executionPrompt);
       case "Agent Skill": {
         const g = new GeminiWithFiles({
@@ -394,6 +432,7 @@ var LlmAgent = class LlmAgent {
           systemInstruction: {
             parts: [{ text: `Strictly apply this skill:\n\n${cap.content}` }],
           },
+          history: [...this.history],
         });
         return g.generateContent({ q: executionPrompt });
       }
@@ -402,6 +441,7 @@ var LlmAgent = class LlmAgent {
           apiKey: this.apiKey,
           model: this.model,
           tools: [cap._tool],
+          history: [...this.history],
         });
         return g.generateContent({ q: executionPrompt });
       }
