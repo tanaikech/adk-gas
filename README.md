@@ -215,8 +215,8 @@ The `new LlmAgent(config)` constructor accepts an extensive configuration object
 | `instruction`            | String/Object |    No    | Global system instruction. Supports `{var_name}` interpolation.                                                      |
 | `state`                  | Object        |    No    | Key-value mapping for dynamic state variables. Replaces `{var_name}`.                                                |
 | `tools`                  | Array         |    No    | Array of native GAS functions mapped to the tool schema.                                                             |
-| `mcpServers`             | Array         |    No    | Array of external MCP Server URLs for dynamic capability discovery.                                                  |
-| `a2aServerAgentCardURLs` | Array         |    No    | Array of remote Agent Card URLs for A2A collaboration.                                                               |
+| `mcpServers`             | Array         |    No    | Array of external MCP Server URLs or JSON objects (for custom server routing) for dynamic capability discovery.      |
+| `a2aServerAgentCardURLs` | Array         |    No    | Array of remote Agent Card URLs or JSON objects (for custom server routing) for A2A collaboration.                     |
 | `subAgents`              | Array         |    No    | Array of child `LlmAgent` instances for hierarchical delegation.                                                     |
 | `skillFolderId`          | String        |    No    | Google Drive Folder ID containing `.md` files for Agent Skills.                                                      |
 | `codeExecutor`           | Object        |    No    | Configuration object to enable Python execution Built-in capabilities.                                               |
@@ -225,6 +225,36 @@ The `new LlmAgent(config)` constructor accepts an extensive configuration object
 | `timeoutMs`              | Number        |    No    | Milliseconds before triggering a forced abort to evade the GAS 6-minute kill switch. Defaults to `280000` (280s).    |
 | `maxResultLength`        | Number        |    No    | Maximum allowed string length per execution before truncation. Prevents payload crashes. Defaults to `20000`.        |
 | `outputSchema`           | Object        |    No    | Strict JSON Schema declaration. Forces the Synthesizer to format the output, disabling the direct Fast-Track bypass. |
+
+### Custom Server Name Routing (v1.3.0+)
+
+From v1.3.0, you can specify custom user-defined server names in `mcpServers` and `a2aServerAgentCardURLs` by using a JSON object instead of a simple string URL. This custom name is injected into the LLM context to ensure accurate routing when the user references specific servers by their aliases.
+
+#### Format:
+- **String URL (Standard)**: `"https://example.com/mcp"`
+- **JSON Object (Custom Name)**: `{ "custom-server-alias": { "httpUrl": "https://example.com/mcp" } }`
+
+#### Example:
+```javascript
+const agent = new LlmAgent({
+  apiKey: API_KEY,
+  mcpServers: [
+    "https://basic.mcp.example.com", // Standard string URL
+    {
+      "server-trigger-test-project1": { // Custom server name
+        httpUrl: "https://script.google.com/macros/s/{deploymentID}/exec?accessKey=sample"
+      }
+    }
+  ],
+  a2aServerAgentCardURLs: [
+    {
+      "my-custom-a2a-agent": { // Custom A2A server name
+        httpUrl: "https://script.google.com/macros/s/{deploymentID}/exec/.well-known/agent-card.json?accessKey=sample"
+      }
+    }
+  ]
+});
+```
 
 ### Core Methods
 
@@ -624,5 +654,9 @@ function test_chat_history() {
   - Introduced Clean History Optimization in `A2AApp` (v2.6.0) to filter intermediate LLM reasoning steps from conversation history, preventing token bloat.
   - Implemented server-side History Injection and Event Object cloning in `MCPA2Aserver`.
   - Introduced Fast-Track Halt Optimization (`_gemini_halt`) to bypass synthesis loops on explicit server functions.
+
+- v1.3.0 (June 3, 2026)
+  - Added Custom Server Name Routing to specify user-defined server names as aliases in MCP and A2A configurations.
+  - Supports string URLs or custom JSON objects (with custom server names as keys and URL configurations as values) in `mcpServers` and `a2aServerAgentCardURLs`.
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)

@@ -1,12 +1,15 @@
 /**
  * LlmAgent.js
- * [Production Release v1.2.0] - The Ultimate Autonomous Orchestrator with Chat History
+ * [Production Release v1.3.0] - The Ultimate Autonomous Orchestrator with Custom Server Routing
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
  * the rigorous execution limits of Google Apps Script (GAS).
  *
  * [Core Capabilities]:
+ * - **Custom Server Name Routing**: Intelligently parses user-defined custom server names
+ *   from MCP and A2A configurations, injecting them into the LLM's context to guarantee
+ *   flawless tool selection when users reference specific servers by their custom aliases.
  * - **One-Pass Fast-Track**: Radically reduces latency and token costs. If a prompt requires
  *   no external tools, the Planner generates the final answer directly, bypassing the
  *   execution and synthesis loops entirely.
@@ -25,7 +28,14 @@
  * const agent = new LlmAgent({
  *   apiKey: "YOUR_GEMINI_API_KEY",
  *   name: "OrchestratorPrime",
- *   mcpServers: ["https://basic.mcp.example.com"]
+ *   mcpServers: [
+ *     "https://basic.mcp.example.com", // Standard string URL
+ *     {
+ *       "server set-trigge-test-project1": { // User-defined custom server name
+ *         httpUrl: "https://script.google.com/macros/s/{deploymentID}/exec?accessKey=sample"
+ *       }
+ *     }
+ *   ]
  * });
  * agent.setServices({ lock: LockService.getScriptLock() });
  *
@@ -34,7 +44,7 @@
  *   { role: "user", parts: [{ text: "Hello, my project code is XRAY-7." }] },
  *   { role: "model", parts: [{ text: "I have recorded your project code as XRAY-7." }] }
  * ]);
- * const result = agent.run("What is my project code?");
+ * const result = agent.run("Trigger my custom server: server set-trigge-test-project1");
  * console.log(agent.getHistory());
  */
 var LlmAgent = class LlmAgent {
@@ -157,6 +167,24 @@ var LlmAgent = class LlmAgent {
     }
   }
 
+  /**
+   * Extracts the custom user-defined server name from a configuration array item.
+   * Matches objects like: { "custom_name": { httpUrl: "..." } }
+   *
+   * @param {string|Object} item - The configuration item from mcpServers or a2aServerAgentCardURLs.
+   * @returns {string|null} The custom server name, or null if not applicable.
+   */
+  _extractCustomName(item) {
+    if (typeof item === "object" && item !== null && !Array.isArray(item)) {
+      const keys = Object.keys(item);
+      // Ensure the object has exactly one key acting as the custom name alias
+      if (keys.length === 1 && typeof item[keys[0]] === "object") {
+        return keys[0];
+      }
+    }
+    return null;
+  }
+
   _initializeCapabilities(logCallback = null) {
     this._requireLockService();
     if (this._capabilitiesInitialized) return;
@@ -203,6 +231,7 @@ var LlmAgent = class LlmAgent {
         if (initClient?.mcpServerObj?.length > 0) {
           initClient.mcpServerObj.forEach((obj, idx) => {
             const originalUrlOrObj = obj.original || this.mcpServers[idx];
+            const customName = this._extractCustomName(this.mcpServers[idx]);
             const sInfo = obj.initialize?.result?.serverInfo || {
               name: `MCPServer_${idx}`,
               version: "unknown",
@@ -222,16 +251,20 @@ var LlmAgent = class LlmAgent {
               required_parameters: t.inputSchema?.required || [],
             }));
 
+            // Override display name if user provided a custom name
+            const displayName = customName || sInfo.name;
+
             this.capabilities.push({
               id: `mcp_${idx}`,
               type: "MCP Server",
-              name: sInfo.name,
+              name: displayName,
               description: {
+                custom_server_name: customName || undefined,
                 server_name: sInfo.name,
                 version: sInfo.version,
                 tools: toolDescriptions,
               },
-              URL: originalUrlOrObj,
+              URL: originalUrlOrObj, // Kept intact for downward GASADK compat
             });
           });
         }
@@ -250,8 +283,13 @@ var LlmAgent = class LlmAgent {
 
         agentCards.forEach((card, idx) => {
           if (card?.url) {
+            const customName = this._extractCustomName(
+              this.a2aServerAgentCardURLs[idx],
+            );
+            const displayName = customName || card.name || `A2AServer_${idx}`;
             const safeCardInfo = {
-              name: card.name,
+              custom_server_name: customName || undefined,
+              original_card_name: card.name,
               description: card.description,
               skills: (card.skills || []).map((s) => ({
                 name: s.name,
@@ -261,10 +299,10 @@ var LlmAgent = class LlmAgent {
             this.capabilities.push({
               id: `a2a_${idx}`,
               type: "A2A Server",
-              name: card.name || `A2AServer_${idx}`,
+              name: displayName,
               description: safeCardInfo,
               URL: card.url,
-              _card: card,
+              _card: card, // Kept intact for downward GASADK compat
             });
           }
         });
@@ -537,6 +575,7 @@ ${JSON.stringify(plannerCapabilities, null, 2)}
 
 Instructions:
 1. Decompose the prompt into sequential tasks. Select exactly ONE capability per task by its "id".
+   *CRITICAL*: If the user explicitly mentions a custom server name in their prompt, you MUST tightly match it against the "custom_server_name" or "name" fields in the capabilities list to ensure accurate tool routing.
 2. Selective Context Passing (depends_on): Evaluate dependencies. Include previous "task_id" in "depends_on" if strictly required.
 3. SUB-AGENT PROMPT STYLING (CRITICAL): Delegate to 'MCP Server' or 'A2A Server' using natural language queries, not robotic instructions.
 4. ONE-PASS FAST-TRACK (CRITICAL): If NO capabilities are required to answer the prompt entirely, set "requires_capabilities" to false, and write your complete response in "direct_answer". You MUST append "\n\nExecution Summary: NO capabilities were used." at the end of "direct_answer". Leave "plan" empty.
