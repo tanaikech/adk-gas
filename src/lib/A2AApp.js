@@ -55,7 +55,7 @@ const toLog_ = (kind, text) => {
  *
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.6.0 (Clean History Optimization)
+ * Version: 2.7.0 (Direct JSON-RPC Bypass Optimization)
  * GitHub: https://github.com/tanaikech/A2AApp
  * @class
  */
@@ -303,13 +303,25 @@ var A2AApp = class A2AApp {
         agentCardUrls = [],
         agentCards = [],
         history = this.history || [],
+        directRouting = false,
       } = object;
       object.history = history;
       if (agentCards.length === 0 && agentCardUrls.length > 0) {
         object.agentCards = this.getAgentCards(agentCardUrls);
       }
 
-      const res = this.processAgents_(object);
+      let res;
+      // [Optimization v2.7.0]: If directRouting is flagged (via LlmAgent), cleanly bypass ALL LLM Mock Orchestration
+      // and directly dispatch the JSON-RPC to the network layer.
+      if (
+        directRouting &&
+        object.agentCards &&
+        object.agentCards.length === 1
+      ) {
+        res = this.dispatchDirectRPC_(object);
+      } else {
+        res = this.processAgents_(object);
+      }
 
       // Safe History Updating
       if (res && res.history) {
@@ -655,6 +667,137 @@ var A2AApp = class A2AApp {
     } catch (err) {
       console.error("--- Failed to write to log sheet.", err);
     }
+  }
+
+  /**
+   * [Direct Routing: Fast-Track JSON-RPC Dispatcher]
+   * Radically optimized pipeline for execution when an Orchestrator explicitly assigns a specific target card.
+   * Discards the massive overhead of Phase 3 to 7 LLM proxy emulation logic.
+   * @private
+   */
+  dispatchDirectRPC_(object) {
+    const { apiKey, prompt, agentCards, history = [] } = object;
+    const targetAgent = agentCards[0];
+
+    const phaseTag = "[Direct Routing: Fast-Track JSON-RPC]";
+    console.log(
+      `${phaseTag} Bypassing internal LLM orchestration to dispatch natively.`,
+    );
+    this.addLog_(
+      new Date(),
+      phaseTag,
+      null,
+      "client internal",
+      `Target Agent Resolved: ${targetAgent.name || "Unknown Agent"}`,
+    );
+
+    const id1 = Utilities.newBlob(new Date().getTime().toString())
+      .getBytes()
+      .map((byte) => ("0" + (byte & 0xff).toString(16)).slice(-2))
+      .join("");
+    const id2 = Utilities.getUuid();
+    const id3 = Utilities.getUuid();
+
+    const resObj = {
+      jsonrpc: this.jsonrpc,
+      id: id1,
+      method: "tasks/send",
+      params: {
+        id: id2,
+        sessionId: id3,
+        message: {
+          role: "user",
+          parts: [{ type: "text", text: prompt }],
+        },
+        acceptedOutputModes: ["text", "text/plain"],
+        history: history,
+      },
+    };
+
+    const combinedHeaders = {
+      ...this.headers,
+      ...(targetAgent.customHeaders || {}),
+    };
+
+    const req = {
+      url: targetAgent.url,
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(resObj),
+      headers: combinedHeaders,
+      muteHttpExceptions: true,
+    };
+
+    console.log(`${phaseTag} Dispatching request to: ${req.url}`);
+    this.addLog_(
+      new Date(),
+      phaseTag,
+      null,
+      "client --> server",
+      `JSON-RPC Payload dispatched.`,
+    );
+
+    const re = UrlFetchApp.fetch(req.url, req);
+    const code = re.getResponseCode();
+    const body = re.getContentText();
+
+    console.log(`${phaseTag} Remote agent responded with HTTP Code: ${code}`);
+    this.addLog_(
+      new Date(),
+      phaseTag,
+      null,
+      "server --> client",
+      `Code: ${code}, Body: ${body.substring(0, 1500)}`,
+    );
+
+    let results = [];
+    if (code === 200) {
+      try {
+        const oo = JSON.parse(body);
+        if (oo.result && oo.result.status?.state === "completed") {
+          const sArtifacts = (oo.result.artifacts || []).flatMap(
+            ({ parts }) => parts,
+          );
+          const messageParts = oo.result.status.message?.parts || [];
+
+          const uniqueTexts = new Set();
+          const m = [...messageParts, ...sArtifacts].filter((part) => {
+            if (part.type === "text") {
+              const txt = part.text || "";
+              if (uniqueTexts.has(txt)) return false;
+              uniqueTexts.add(txt);
+            }
+            return true;
+          });
+
+          results = m.map((part) => part.text || part);
+        } else if (oo.error) {
+          results.push(
+            `Error: Remote agent returned error: ${JSON.stringify(oo.error)}`,
+          );
+        } else {
+          results.push(`Error: Invalid response structure. Body: ${body}`);
+        }
+      } catch (e) {
+        results.push(`Error: Failed to parse JSON response. Body: ${body}`);
+      }
+    } else {
+      results.push(`Error: Remote agent returned HTTP ${code}. Body: ${body}`);
+    }
+
+    const historyAnswerText = results
+      .map((e) => (typeof e === "string" ? e : "[Binary Data]"))
+      .join("\n");
+    const cleanHistory = [...history];
+    if (prompt) cleanHistory.push({ role: "user", parts: [{ text: prompt }] });
+    if (historyAnswerText)
+      cleanHistory.push({
+        role: "model",
+        parts: [{ text: historyAnswerText }],
+      });
+
+    console.log(`${phaseTag} Sequence completed successfully.`);
+    return { result: results, history: cleanHistory, agentCards };
   }
 
   /**
@@ -1113,7 +1256,8 @@ var A2AApp = class A2AApp {
     g.history = [...history, ...(g.history || [])];
 
     const textPrompt = `User's prompt is as follows.\n<UserPrompt>${prompt}</UserPrompt>`;
-    const orderAr = g.generateContent({ q: textPrompt });
+    const orderArTemp = g.generateContent({ q: textPrompt });
+    const orderAr = Array.isArray(orderArTemp) ? orderArTemp : [];
 
     const msgOrder = `Determined Execution Order: ${JSON.stringify(orderAr)}`;
     console.log(`${phase4Tag} ${msgOrder}`);

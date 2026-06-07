@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v1.3.0] - The Ultimate Autonomous Orchestrator with Custom Server Routing
+ * [Production Release v1.3.1] - The Ultimate Autonomous Orchestrator with Custom Server Routing
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -23,29 +23,28 @@
  *   completely resolving 'Planner Context Blindness' for relative temporal queries (e.g., "tomorrow").
  * - **Seamless Chat Context**: Maintains and propagates conversation history dynamically to
  *   sub-agents, MCP servers, and A2A remote servers without polluting the core logic history.
+ * - **Local JSON Bypass (v1.3.1)**: Allows feeding pre-fetched Agent Card JSON objects directly
+ *   to bypass redundant HTTP requests, slashing network latency for A2A protocols.
  *
  * @usage
  * const agent = new LlmAgent({
  *   apiKey: "YOUR_GEMINI_API_KEY",
  *   name: "OrchestratorPrime",
- *   mcpServers: [
- *     "https://basic.mcp.example.com", // Standard string URL
+ *   a2aServerAgentCardURLs: [
+ *     "https://script.google.com/macros/s/{deploymentID}/exec"
+ *   ],
+ *   a2aServerAgentCardJSONs: [
  *     {
- *       "server set-trigge-test-project1": { // User-defined custom server name
- *         httpUrl: "https://script.google.com/macros/s/{deploymentID}/exec?accessKey=sample"
+ *       "server local-cache-agent": {
+ *         name: "CachedAgent",
+ *         url: "https://script.google.com/macros/s/{deploymentID}/exec",
+ *         description: "Bypasses HTTP fetch.",
+ *         skills: [...]
  *       }
  *     }
  *   ]
  * });
  * agent.setServices({ lock: LockService.getScriptLock() });
- *
- * // --- Chat History Example ---
- * agent.setHistory([
- *   { role: "user", parts: [{ text: "Hello, my project code is XRAY-7." }] },
- *   { role: "model", parts: [{ text: "I have recorded your project code as XRAY-7." }] }
- * ]);
- * const result = agent.run("Trigger my custom server: server set-trigge-test-project1");
- * console.log(agent.getHistory());
  */
 var LlmAgent = class LlmAgent {
   constructor(config = {}) {
@@ -71,6 +70,7 @@ var LlmAgent = class LlmAgent {
     this.tools = config.tools || [];
     this.mcpServers = config.mcpServers || [];
     this.a2aServerAgentCardURLs = config.a2aServerAgentCardURLs || [];
+    this.a2aServerAgentCardJSONs = config.a2aServerAgentCardJSONs || [];
     this.subAgents = config.subAgents || [];
     this.skillFolderId = config.skillFolderId || "";
 
@@ -171,7 +171,7 @@ var LlmAgent = class LlmAgent {
    * Extracts the custom user-defined server name from a configuration array item.
    * Matches objects like: { "custom_name": { httpUrl: "..." } }
    *
-   * @param {string|Object} item - The configuration item from mcpServers or a2aServerAgentCardURLs.
+   * @param {string|Object} item - The configuration item from mcpServers or a2aServerAgentCardURLs/JSONs.
    * @returns {string|null} The custom server name, or null if not applicable.
    */
   _extractCustomName(item) {
@@ -273,19 +273,61 @@ var LlmAgent = class LlmAgent {
       }
     }
 
-    // 3. A2A Servers
-    if (this.a2aServerAgentCardURLs?.length > 0) {
+    // 3. A2A Servers (URL and Direct JSON Bypass Integration)
+    if (
+      this.a2aServerAgentCardURLs?.length > 0 ||
+      this.a2aServerAgentCardJSONs?.length > 0
+    ) {
       try {
+        const combinedA2AConfigs = [];
         const a2aApp = new A2AApp().setServices(this.services);
-        const agentCards = [].concat(
-          a2aApp.getAgentCards(this.a2aServerAgentCardURLs) || [],
-        );
 
-        agentCards.forEach((card, idx) => {
-          if (card?.url) {
-            const customName = this._extractCustomName(
-              this.a2aServerAgentCardURLs[idx],
+        // 3a. Process Remote URLs
+        if (this.a2aServerAgentCardURLs?.length > 0) {
+          try {
+            const agentCards = [].concat(
+              a2aApp.getAgentCards(this.a2aServerAgentCardURLs) || [],
             );
+            agentCards.forEach((card, idx) => {
+              if (card?.url) {
+                combinedA2AConfigs.push({
+                  card: card,
+                  sourceConfig: this.a2aServerAgentCardURLs[idx],
+                });
+              }
+            });
+          } catch (fetchErr) {
+            log("A2A Server URL retrieval failed", { error: fetchErr.message });
+          }
+        }
+
+        // 3b. Process Local Direct JSON Bypass
+        if (this.a2aServerAgentCardJSONs?.length > 0) {
+          this.a2aServerAgentCardJSONs.forEach((jsonConfig) => {
+            let card = jsonConfig;
+            const customName = this._extractCustomName(jsonConfig);
+            // If the JSON is wrapped with a custom name alias, unwrap it to get the raw card
+            if (
+              customName &&
+              typeof jsonConfig[customName] === "object" &&
+              !Array.isArray(jsonConfig[customName])
+            ) {
+              card = jsonConfig[customName];
+            }
+            if (card) {
+              combinedA2AConfigs.push({
+                card: card,
+                sourceConfig: jsonConfig,
+              });
+            }
+          });
+        }
+
+        // 3c. Capability Registration
+        combinedA2AConfigs.forEach(({ card, sourceConfig }, idx) => {
+          if (card?.url || card?.name) {
+            // Fallback validation for edge cases
+            const customName = this._extractCustomName(sourceConfig);
             const displayName = customName || card.name || `A2AServer_${idx}`;
             const safeCardInfo = {
               custom_server_name: customName || undefined,
@@ -301,8 +343,8 @@ var LlmAgent = class LlmAgent {
               type: "A2A Server",
               name: displayName,
               description: safeCardInfo,
-              URL: card.url,
-              _card: card, // Kept intact for downward GASADK compat
+              URL: card.url || `local_json_bypass_${idx}`,
+              _card: card, // Downward injected cleanly into A2AApp context
             });
           }
         });
@@ -447,12 +489,18 @@ var LlmAgent = class LlmAgent {
         return res?.result || res;
       }
       case "A2A Server": {
-        const a2aApp = new A2AApp().setServices(this.services);
+        // [Optimization v1.3.1]: Pass LlmAgent model settings to A2AApp context natively
+        const a2aApp = new A2AApp({ model: this.model }).setServices(
+          this.services,
+        );
+        // By passing agentCards directly, A2AApp guarantees a zero-latency HTTP bypass for card fetching.
+        // By passing directRouting: true, we cleanly bypass A2AApp's internal local double-planning (Phase 3-7).
         const res = a2aApp.client({
           apiKey: this.apiKey,
           prompt: executionPrompt,
           agentCards: [cap._card],
           history: [...this.history],
+          directRouting: true,
         });
         if (res?.error)
           throw new Error(`A2A Error: ${JSON.stringify(res.error)}`);
@@ -579,6 +627,7 @@ Instructions:
 2. Selective Context Passing (depends_on): Evaluate dependencies. Include previous "task_id" in "depends_on" if strictly required.
 3. SUB-AGENT PROMPT STYLING (CRITICAL): Delegate to 'MCP Server' or 'A2A Server' using natural language queries, not robotic instructions.
 4. ONE-PASS FAST-TRACK (CRITICAL): If NO capabilities are required to answer the prompt entirely, set "requires_capabilities" to false, and write your complete response in "direct_answer". You MUST append "\n\nExecution Summary: NO capabilities were used." at the end of "direct_answer". Leave "plan" empty.
+5. BAN ON SYNTHESIS TASKS (CRITICAL): Do NOT create tasks for compiling, summarizing, formatting, or synthesizing the final answer. The system automatically executes a final synthesis phase using all gathered data. Create tasks ONLY for actively executing tools or fetching data.
 `;
 
     log("Planning phase initiated.");

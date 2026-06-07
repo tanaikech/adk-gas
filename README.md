@@ -28,6 +28,8 @@ At the core of GASADK is the **LlmAgent**, powered by the **Planner-Executor-Syn
    Maintains and propagates conversation history dynamically to sub-agents, MCP servers, and remote A2A servers without polluting the core logic history. Massive internal intermediate LLM reasoning steps (function calls, planning thoughts) are filtered out, constructing a clean user/model role-based chat history to prevent token bloat and quota exhaustion.
 7. **Fast-Track Halt Optimization**
    Allows server functions to forcefully bypass the server-side LLM synthesis loop (by returning `_gemini_halt: true`). This prevents endless generative loops, eliminates unnecessary token usage, and guarantees instant response times for purely algorithmic/computational tool executions.
+8. **Direct JSON-RPC Bypass & Direct Routing (v1.3.1)**
+   Bypasses the entire multi-phase LLM mock orchestration when `directRouting` is flagged and a single target card is assigned, dispatching the JSON-RPC request natively to slash network latency. It also supports local pre-fetched Agent Cards through `a2aServerAgentCardJSONs` to completely bypass remote HTTP fetches.
 
 ### GASADK vs. TS ADK (`@google/adk`) Paradigm Shift
 
@@ -217,6 +219,7 @@ The `new LlmAgent(config)` constructor accepts an extensive configuration object
 | `tools`                  | Array         |    No    | Array of native GAS functions mapped to the tool schema.                                                             |
 | `mcpServers`             | Array         |    No    | Array of external MCP Server URLs or JSON objects (for custom server routing) for dynamic capability discovery.      |
 | `a2aServerAgentCardURLs` | Array         |    No    | Array of remote Agent Card URLs or JSON objects (for custom server routing) for A2A collaboration.                     |
+| `a2aServerAgentCardJSONs`| Array         |    No    | Array of local pre-fetched Agent Card JSON objects (supports custom name aliases) to bypass HTTP card retrieval.      |
 | `subAgents`              | Array         |    No    | Array of child `LlmAgent` instances for hierarchical delegation.                                                     |
 | `skillFolderId`          | String        |    No    | Google Drive Folder ID containing `.md` files for Agent Skills.                                                      |
 | `codeExecutor`           | Object        |    No    | Configuration object to enable Python execution Built-in capabilities.                                               |
@@ -250,6 +253,35 @@ const agent = new LlmAgent({
     {
       "my-custom-a2a-agent": { // Custom A2A server name
         httpUrl: "https://script.google.com/macros/s/{deploymentID}/exec/.well-known/agent-card.json?accessKey=sample"
+      }
+    }
+  ]
+});
+```
+
+### Local JSON Bypass & Direct Routing (v1.3.1+)
+
+From v1.3.1, you can pass pre-fetched Agent Card JSON objects directly to `a2aServerAgentCardJSONs`. This completely bypasses the HTTP card retrieval process, resolving the network latency overhead. When combined with `directRouting`, GASADK automatically bypasses the internal multi-step LLM planning proxy layers, executing direct JSON-RPC dispatch to the remote agent.
+
+#### Example:
+```javascript
+const agent = new LlmAgent({
+  apiKey: API_KEY,
+  a2aServerAgentCardJSONs: [
+    {
+      "local-cached-agent": { // Custom server name
+        name: "CachedAgent",
+        url: "https://script.google.com/macros/s/{deploymentID}/exec",
+        description: "Directly loaded JSON agent card.",
+        skills: [
+          {
+            id: "get_exchange_rate",
+            name: "Currency Exchange Rates Tool",
+            description: "Helps with exchange values",
+            inputModes: ["text/plain"],
+            outputModes: ["text/plain"]
+          }
+        ]
       }
     }
   ]
@@ -658,5 +690,10 @@ function test_chat_history() {
 - v1.3.0 (June 3, 2026)
   - Added Custom Server Name Routing to specify user-defined server names as aliases in MCP and A2A configurations.
   - Supports string URLs or custom JSON objects (with custom server names as keys and URL configurations as values) in `mcpServers` and `a2aServerAgentCardURLs`.
+
+- v1.3.1 (June 7, 2026)
+  - Added `a2aServerAgentCardJSONs` support to bypass HTTP fetching of Agent Cards, allowing direct JSON injection.
+  - Implemented Direct JSON-RPC Bypass (`directRouting` optimization in A2AApp v2.7.0) to route requests directly to remote agents, slashing network and orchestration latency when specific target agents are known.
+  - Added strict ban on synthesis tasks in system prompt instructions to prevent redundant LLM compile phases.
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)
