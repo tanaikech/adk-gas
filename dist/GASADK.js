@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v1.3.1] - The Ultimate Autonomous Orchestrator with Custom Server Routing
+ * [Production Release v1.3.2] - The Ultimate Autonomous Orchestrator with Custom Server Routing
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -911,7 +911,7 @@ Objective:
 /**
  * GeminiWithFiles
  * Author: Kanshi Tanaike
- * Version: 2.0.29
+ * Version: 2.0.30
  * GitHub: https://github.com/tanaikech/GeminiWithFiles
  * @class
  */
@@ -943,7 +943,8 @@ var GeminiWithFiles = class GeminiWithFiles {
       skillFolderId,
     } = object;
 
-    this.model = model || "models/gemini-3-flash-preview";
+    // Updated default model to models/gemini-3.1-flash-lite
+    this.model = model || "models/gemini-3.1-flash-lite";
     this.version = version || "v1beta";
 
     const baseUrl = "https://generativelanguage.googleapis.com";
@@ -1046,7 +1047,8 @@ var GeminiWithFiles = class GeminiWithFiles {
           Array.isArray(systemInstruction.parts)
         ) {
           systemInstructionText =
-            systemInstruction.parts.map((p) => p.text).join("\n") + "\n\n";
+            systemInstruction.parts.map((p) => p.text || "").join("\n") +
+            "\n\n";
         }
       }
 
@@ -1076,13 +1078,27 @@ var GeminiWithFiles = class GeminiWithFiles {
     this.asImage = asImage;
     return this;
   }
+
   setBlobs(blobs) {
     this.blobs.push(...blobs);
     return this;
   }
+
   setFileIdsOrUrlsWithResumableUpload(array) {
     this.resumableUploads.push(...array);
     return this;
+  }
+
+  /**
+   * Helper method to extract the original filename from a Gemini File API displayName.
+   * Removes 'fileId@' or 'blobName@' prefixes and '$page@X$maxPage@Y' suffixes safely.
+   */
+  _extractOriginalFilename(displayName) {
+    if (!displayName) return "unknown_file";
+    const match = displayName.match(
+      /^(?:fileId|blobName)@(.+?)(?:\$page@\d+\$maxPage@\d+)?$/,
+    );
+    return match && match[1] ? match[1] : displayName;
   }
 
   withUploadedFilesByGenerateContent(fileList = [], retry = 3) {
@@ -1100,19 +1116,23 @@ var GeminiWithFiles = class GeminiWithFiles {
     }
     const obj = new Map();
     for (const e of fileList) {
-      let k = e.displayName;
-      if (k.startsWith("fileId@")) k = k.split("$")[0].split("@")[1];
-      else if (k.startsWith("blobName@")) k = k.split("@")[1];
+      let k = this._extractOriginalFilename(e.displayName);
       if (obj.has(k)) obj.get(k).push(e);
       else obj.set(k, [e]);
     }
     this.fileList = Array.from(obj.values()).map((files) => {
-      if (files.length > 0 && files[0].displayName.startsWith("fileId@")) {
-        files.sort(
-          (a, b) =>
-            Number(a.displayName.split("$")[1].split("@")[1]) -
-            Number(b.displayName.split("$")[1].split("@")[1]),
-        );
+      // Only sort if there are multiple parts matching the PDF page convention
+      if (
+        files.length > 1 &&
+        files[0].displayName.match(/\$page@\d+\$maxPage@\d+$/)
+      ) {
+        files.sort((a, b) => {
+          const getPage = (name) => {
+            const m = name.match(/\$page@(\d+)/);
+            return m ? Number(m[1]) : 0;
+          };
+          return getPage(a.displayName) - getPage(b.displayName);
+        });
       }
       return { files };
     });
@@ -1200,7 +1220,7 @@ var GeminiWithFiles = class GeminiWithFiles {
 
     const files = this.fileList.flatMap(({ files, mimeType, uri, name }) => {
       if (files && Array.isArray(files)) {
-        let fileName = files[0].displayName.split("@").pop().split("$")[0];
+        let fileName = this._extractOriginalFilename(files[0].displayName);
         return [
           {
             text: `[Filename of the following file is ${fileName}. Total pages are ${files.length}.]`,
@@ -1239,6 +1259,17 @@ var GeminiWithFiles = class GeminiWithFiles {
     const requestHeaders = this.queryParameters.key
       ? {}
       : { headers: this.headers };
+
+    const formatReturnValue = (val) => {
+      if (!this.exportTotalTokens) return val;
+      return {
+        returnValue: val,
+        usageMetadata: usageMetadataObj,
+        inputTokenCount: usageMetadataObj?.promptTokenCount || 0,
+        outputTokenCount: usageMetadataObj?.candidatesTokenCount || 0,
+        totalTokenCount: usageMetadataObj?.totalTokenCount || 0,
+      };
+    };
 
     do {
       retry--;
@@ -1487,7 +1518,7 @@ var GeminiWithFiles = class GeminiWithFiles {
                 ...(chk.functionCall.id ? { id: chk.functionCall.id } : {}),
               },
             });
-            break; // Break the tools iteration loop
+            break;
           }
 
           if (
@@ -1548,15 +1579,8 @@ var GeminiWithFiles = class GeminiWithFiles {
         "[GeminiWithFiles Error] Maximum retry limit exceeded. The model got stuck in an unresolvable loop.",
       );
 
-    // Provide the forced halt response securely maintaining formatting configurations
     if (forceHaltResult) {
-      if (this.exportTotalTokens) {
-        return {
-          returnValue: forceHaltResult,
-          usageMetadata: usageMetadataObj,
-        };
-      }
-      return forceHaltResult;
+      return formatReturnValue(forceHaltResult);
     }
 
     const output = results[results.length - 1];
@@ -1573,18 +1597,14 @@ var GeminiWithFiles = class GeminiWithFiles {
         ? output.text.trim()
         : output;
 
+    let parsedReturnValue;
     try {
-      if (this.exportTotalTokens)
-        return {
-          returnValue: JSON.parse(returnValue),
-          usageMetadata: usageMetadataObj,
-        };
-      return JSON.parse(returnValue);
+      parsedReturnValue = JSON.parse(returnValue);
     } catch (stack) {
-      if (this.exportTotalTokens)
-        return { returnValue, usageMetadata: usageMetadataObj };
-      return returnValue;
+      parsedReturnValue = returnValue;
     }
+
+    return formatReturnValue(parsedReturnValue);
   }
 
   chat(obj, options = {}) {

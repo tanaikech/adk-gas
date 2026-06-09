@@ -696,4 +696,7 @@ function test_chat_history() {
   - Implemented Direct JSON-RPC Bypass (`directRouting` optimization in A2AApp v2.7.0) to route requests directly to remote agents, slashing network and orchestration latency when specific target agents are known.
   - Added strict ban on synthesis tasks in system prompt instructions to prevent redundant LLM compile phases.
 
+- v1.3.2 (June 9, 2026)
+  - Updated `GeminiWithFiles` to v2.0.30.
+
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)
