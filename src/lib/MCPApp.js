@@ -2,8 +2,8 @@
  * Class object for MCP (Model Context Protocol).
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.2.0
- * Date: 2026-05-19
+ * Version: 2.3.0 (Multi-Channel Sheet Logging Update)
+ * Date: 2026-06-10
  * GitHub: https://github.com/tanaikech/MCPApp
  * @class
  */
@@ -12,7 +12,7 @@ var MCPApp = class MCPApp {
    * @param {Object} object - Object used to initialize this script.
    * @param {string} [object.accessKey=null] - Default is null. Used for accessing the Web Apps.
    * @param {boolean}[object.log=false] - Default is false. When true, the log between the MCP client and server is stored in Google Sheets.
-   * @param {string} [object.spreadsheetId] - Spreadsheet ID. Logs are stored in the "log" sheet of this spreadsheet.
+   * @param {string} [object.spreadsheetId] - Spreadsheet ID. Logs are stored in the "MCP" sheet of this spreadsheet if provided, otherwise "log" sheet.
    * @param {boolean} [object.lock=true] - Default is true. By default, the script runs with LockService to prevent concurrency issues.
    * @return {MCPApp}
    */
@@ -59,9 +59,11 @@ var MCPApp = class MCPApp {
       const ss = spreadsheetId
         ? SpreadsheetApp.openById(spreadsheetId)
         : SpreadsheetApp.create("Log_MCPApp");
+      const targetSheetName = spreadsheetId ? "MCP" : "log";
+      const headers = ["Date", "Method", "ID", "Direction", "Message"];
 
       /** @private */
-      this.sheet = ss.getSheetByName("log") || ss.insertSheet("log");
+      this.sheet = this._getOrCreateSheet(ss, targetSheetName, headers);
     }
 
     /** @private */
@@ -74,6 +76,42 @@ var MCPApp = class MCPApp {
 
     /** @private */
     this.clientObject = {};
+  }
+
+  /**
+   * ### Description
+   * Thread-safe helper to retrieve or create a log sheet with custom headers under concurrent lock.
+   *
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - The Google Spreadsheet instance.
+   * @param {string} name - The target sheet name.
+   * @param {string[]} [headers] - Optional headers for a newly created sheet.
+   * @return {GoogleAppsScript.Spreadsheet.Sheet}
+   * @private
+   */
+  _getOrCreateSheet(ss, name, headers) {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      const lock = LockService.getScriptLock();
+      let lockAcquired = false;
+      try {
+        lockAcquired = lock.tryLock(15000);
+        sheet = ss.getSheetByName(name);
+        if (!sheet) {
+          sheet = ss.insertSheet(name);
+          if (headers && headers.length > 0) {
+            sheet.appendRow(headers);
+            sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+          }
+        }
+      } catch (e) {
+        sheet = ss.getSheetByName(name) || ss.getSheets()[0];
+      } finally {
+        if (lockAcquired) {
+          lock.releaseLock();
+        }
+      }
+    }
+    return sheet;
   }
 
   /**
@@ -260,7 +298,7 @@ var MCPApp = class MCPApp {
           retObj = {
             error: {
               code: this.ErrorCode.InternalError,
-              message: error.stack || String(error),
+              message: `[MCP Server Error] ${error.stack || String(error)}`,
             },
             jsonrpc: this.jsonrpc,
           };
@@ -289,7 +327,7 @@ var MCPApp = class MCPApp {
         retObj = {
           error: {
             code: this.ErrorCode.InvalidParams,
-            message: `No prompt found with name "${resName}".`,
+            message: `[MCP Server Error] No prompt found with name "${resName}".`,
           },
           jsonrpc: this.jsonrpc,
           id,
@@ -348,7 +386,7 @@ var MCPApp = class MCPApp {
           retObj = {
             error: {
               code: this.ErrorCode.MethodNotFound,
-              message: `Method or Function "${method}" could not be executed.`,
+              message: `[MCP Server Error] Method or Function "${method}" could not be executed.`,
             },
             jsonrpc: this.jsonrpc,
           };
@@ -357,7 +395,7 @@ var MCPApp = class MCPApp {
         retObj = {
           error: {
             code: this.ErrorCode.InternalError,
-            message: error.stack || String(error),
+            message: `[MCP Server Error] ${error.stack || String(error)}`,
           },
           jsonrpc: this.jsonrpc,
         };
@@ -727,7 +765,7 @@ var MCPApp = class MCPApp {
         error: {
           code: this.ErrorCode.InternalError,
           message:
-            "Internal planning error. The model returned no execution strategy.",
+            "[MCP Client Error] Internal planning error. The model returned no execution strategy.",
         },
         jsonrpc: this.jsonrpc,
         id: this.id,

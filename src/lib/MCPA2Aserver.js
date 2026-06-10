@@ -1,7 +1,7 @@
 /**
  * MCPA2Aserver: Class Object for Consolidating Generative AI Protocols
  * Author: Tanaike
- * v2.1.0 (History-Aware Update)
+ * v2.2.0 (Multi-Channel Sheet Logging Update)
  * GitHub: https://github.com/tanaikech/MCPA2Aserver-GAS-Library
  *
  * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking,
@@ -20,7 +20,7 @@
  * mcpA2A.setServices({ lock: LockService.getScriptLock() });
  * ```
  *
- * #### 2. Configuration & History Injection (New)
+ * #### 2. Configuration & History Injection
  * Configure your server credentials. You can now inject a "Base History" (e.g., System Persona or absolute facts)
  * that the remote A2A server will always prepend to the incoming client history.
  * ```javascript
@@ -162,6 +162,76 @@ var MCPA2Aserver = class MCPA2Aserver {
   }
 
   /**
+   * Thread-safe helper to fetch or create a spreadsheet sheet with strict lock control.
+   * Prevents parallel-process insertion failures in high-volume environments.
+   *
+   * @private
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - The targeted spreadsheet.
+   * @param {String} name - Name of the required sheet.
+   * @param {Array<String>} [headers] - Optional header array to inject if generating new.
+   * @return {GoogleAppsScript.Spreadsheet.Sheet}
+   */
+  _getOrCreateSheet(ss, name, headers) {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      const lock = LockService.getScriptLock();
+      let lockAcquired = false;
+      try {
+        lockAcquired = lock.tryLock(15000);
+        sheet = ss.getSheetByName(name); // Double check inside the lock boundary
+        if (!sheet) {
+          sheet = ss.insertSheet(name);
+          if (headers && headers.length > 0) {
+            sheet.appendRow(headers);
+            sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+          }
+        }
+      } catch (e) {
+        // Fallback gracefully in case of race condition or parallel writes
+        sheet = ss.getSheetByName(name) || ss.getSheets()[0];
+      } finally {
+        if (lockAcquired) {
+          lock.releaseLock();
+        }
+      }
+    }
+    return sheet;
+  }
+
+  /**
+   * Serializes a generic Apps Script Event Object safely, stripping read-only properties
+   * and cyclical references that trigger standard JSON.stringify errors.
+   *
+   * @private
+   * @param {EventObject} e - Event object received from doGet/doPost.
+   * @return {String} Serialized representation.
+   */
+  serializeEvent_(e) {
+    if (!e) return "null";
+    try {
+      const clone = {
+        queryString: e.queryString || "",
+        parameter: e.parameter || {},
+        parameters: e.parameters || {},
+        contextPath: e.contextPath || "",
+        contentLength: e.contentLength || -1,
+        pathInfo: e.pathInfo || "",
+        postData: e.postData
+          ? {
+              length: e.postData.length,
+              type: e.postData.type,
+              contents: e.postData.contents,
+              name: e.postData.name,
+            }
+          : null,
+      };
+      return JSON.stringify(clone);
+    } catch (err) {
+      return "Error serializing event: " + err.message;
+    }
+  }
+
+  /**
    * Main Dispatcher Method
    * Analyzes context, routes the request, and flushes execution logs to the specified Google Sheet.
    *
@@ -174,6 +244,44 @@ var MCPA2Aserver = class MCPA2Aserver {
     this.execId = Utilities.getUuid();
     this.logs = [];
     this.logCallback = callback;
+    let route = null; // Declared early to avoid reference issues in catch block
+
+    // Setup sheet requirements and log raw requests instantly to raw sheet
+    if (this.logSpreadsheetId) {
+      try {
+        const ss = SpreadsheetApp.openById(this.logSpreadsheetId);
+        this._getOrCreateSheet(ss, "raw", ["Timestamp", "Event Object"]);
+        this._getOrCreateSheet(ss, "MCP", [
+          "Date",
+          "Method",
+          "ID",
+          "Direction",
+          "Message",
+        ]);
+        this._getOrCreateSheet(ss, "A2A", [
+          "Date",
+          "Phase/Method",
+          "ID",
+          "Direction",
+          "Message",
+        ]);
+        this._getOrCreateSheet(ss, "MCPA2Aserver_log", [
+          "Timestamp",
+          "Execution ID",
+          "Direction",
+          "Level",
+          "Message",
+        ]);
+
+        const rawSheet = ss.getSheetByName("raw");
+        const serializedEvent = this.serializeEvent_(e);
+        rawSheet.appendRow([new Date().toISOString(), serializedEvent]);
+      } catch (err) {
+        console.error(
+          "Failed to initialize multi-channel logging: " + err.stack,
+        );
+      }
+    }
 
     this.addLog_("Main dispatcher initiated.", "INFO", "Internal");
 
@@ -222,7 +330,7 @@ var MCPA2Aserver = class MCPA2Aserver {
       }
 
       const processedServers = this.parseContext_(targetContext);
-      const route = this.determineRoute_(e);
+      route = this.determineRoute_(e);
       this.addLog_(`Route determined as: ${route.type}`, "INFO", "Internal");
 
       let targetEvent = e;
@@ -291,9 +399,14 @@ var MCPA2Aserver = class MCPA2Aserver {
         );
       }
     } catch (err) {
-      this.addLog_(`Execution Error: ${err.message}`, "ERROR", "Internal");
+      const processTag = route ? `[${route.type}]` : "[Routing]";
+      this.addLog_(
+        `Execution Error ${processTag}: ${err.message}`,
+        "ERROR",
+        "Internal",
+      );
       response = ContentService.createTextOutput(
-        JSON.stringify({ error: err.message }),
+        JSON.stringify({ error: `[MCPA2Aserver Error] ${err.message}` }),
       ).setMimeType(ContentService.MimeType.JSON);
     }
 
@@ -412,12 +525,6 @@ var MCPA2Aserver = class MCPA2Aserver {
 
       const ss = SpreadsheetApp.openById(this.logSpreadsheetId);
       const sheetName = "MCPA2Aserver_log";
-      let sheet = ss.getSheetByName(sheetName);
-
-      if (!sheet) {
-        sheet = ss.insertSheet(sheetName);
-      }
-
       const headers = [
         "Timestamp",
         "Execution ID",
@@ -425,21 +532,7 @@ var MCPA2Aserver = class MCPA2Aserver {
         "Level",
         "Message",
       ];
-      const lastRow = sheet.getLastRow();
-
-      if (lastRow === 0) {
-        sheet.appendRow(headers);
-        sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
-      } else {
-        const firstCell = sheet.getRange(1, 1).getValue();
-        if (firstCell !== headers[0]) {
-          sheet.insertRowBefore(1);
-          sheet
-            .getRange(1, 1, 1, headers.length)
-            .setValues([headers])
-            .setFontWeight("bold");
-        }
-      }
+      const sheet = this._getOrCreateSheet(ss, sheetName, headers);
 
       const data = this.logs.map((log) => [
         log.timestamp,
@@ -683,9 +776,13 @@ var MCPA2Aserver = class MCPA2Aserver {
       this.addLog_("A2A Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
-      this.addLog_(`A2A Handle Error: ${err.stack}`, "ERROR", "Internal");
+      this.addLog_(
+        `[A2A Server Process Error] A2A Handle Error: ${err.stack}`,
+        "ERROR",
+        "Internal",
+      );
       return ContentService.createTextOutput(
-        JSON.stringify({ error: err.message }),
+        JSON.stringify({ error: `[A2A Server Error] ${err.message}` }),
       ).setMimeType(ContentService.MimeType.JSON);
     }
   }
@@ -712,9 +809,13 @@ var MCPA2Aserver = class MCPA2Aserver {
       this.addLog_("MCP Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
-      this.addLog_(`MCP Handle Error: ${err.stack}`, "ERROR", "Internal");
+      this.addLog_(
+        `[MCP Server Process Error] MCP Handle Error: ${err.stack}`,
+        "ERROR",
+        "Internal",
+      );
       return ContentService.createTextOutput(
-        JSON.stringify({ error: err.message }),
+        JSON.stringify({ error: `[MCP Server Error] ${err.message}` }),
       ).setMimeType(ContentService.MimeType.JSON);
     }
   }

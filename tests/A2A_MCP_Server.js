@@ -1,7 +1,31 @@
 /**
- * Script for Consolidating Generative AI Protocols: A Single Server Solution for MCP and A2A
- * Author: Tanaike
- * Refactored Version with Explicit Override Support, Server-Side History Injection, & Fast-Track Halt Optimization
+ * tests/A2A_MCP_Server.js
+ * [Consolidated Generative AI Protocols Server - v1.3.3 Integration]
+ *
+ * @description
+ * A unified server deployment for Google Apps Script handling both Model Context Protocol (MCP)
+ * and Agent-to-Agent (A2A) communications.
+ *
+ * [Key Updates in v1.3.3]:
+ * - Native Raw Event Logging: The server-side entry points 'doGet' and 'doPost' pass the event 'e'
+ *   directly to MCPA2Aserver.main(), which automatically handles raw event serialization to the
+ *   "raw" sheet. No duplicate manual logging code is required here.
+ * - Auto-Sheet Initialization: All required tracking sheets ("raw", "MCP", "A2A", "MCPA2Aserver_log")
+ *   are automatically validated and created by the library with double-locking protection.
+ *
+ * [Setup Instructions]:
+ * 1. Deploy this script as a Web App:
+ *    - Click "Deploy" > "New deployment".
+ *    - Select type "Web app".
+ *    - Set "Execute as" to "Me".
+ *    - Set "Who has access" to "Anyone".
+ *    - Copy the Web App URL and paste it into the WEB_APPS_URL variable below.
+ * 2. Configure GEMINI_API_KEY:
+ *    - Go to Project Settings (Gear icon) > Script Properties.
+ *    - Add "GEMINI_API_KEY" with your actual Google AI Studio key.
+ * 3. (Optional) Configure Log Spreadsheet:
+ *    - Create a blank Google Spreadsheet.
+ *    - Copy its ID and set it as `logSpreadsheetId` in the `object` configuration below.
  */
 
 const { MCPA2Aserver } = GASADK;
@@ -9,43 +33,31 @@ const { MCPA2Aserver } = GASADK;
 const API_KEY =
   PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
 const WEB_APPS_URL =
-  "https://script.google.com/macros/s/{Your deployment ID}/exec"; // Please set your Web Apps URL.
+  "https://script.google.com/macros/s/{Your deployment ID}/exec"; // MUST match the deployed Web App URL.
 
-// --- Your variables ---
+// Unified Server Configuration Properties
 const object = {
   apiKey: API_KEY,
   model: "models/gemini-3-flash-preview",
   accessKey: "sample",
-  // logSpreadsheetId: "{Google Spreadsheet ID}", // Log is stored to this Google Spreadsheet.
+  // logSpreadsheetId: "YOUR_SPREADSHEET_ID_HERE", // Set your Google Spreadsheet ID to activate multi-channel logging
 };
 
-// --- Entry Points ---
+// Web App entry point for HTTP GET requests
 const doGet = (e) => main(e);
+
+// Web App entry point for HTTP POST requests
 const doPost = (e) => main(e);
 
 /**
- * Main Dispatcher Function
- * Handles the HTTP execution, configures the consolidated server, and routes the request.
+ * Main Dispatcher Entry Point
+ * Decouples, routes, and processes incoming GET/POST transactions.
  *
- * @param {EventObject} e - The event object from doGet/doPost
- * @return {ContentService.TextOutput} The JSON response
+ * @param {EventObject} e - The raw Google Apps Script Event Object.
+ * @return {ContentService.TextOutput} The JSON-RPC or A2A output payload.
  */
 function main(e) {
   const lock = LockService.getScriptLock();
-
-  if (object.logSpreadsheetId) {
-    try {
-      lock.waitLock(10000);
-      SpreadsheetApp.openById(object.logSpreadsheetId)
-        .getSheetByName("raw")
-        .appendRow([new Date(), JSON.stringify(e)]);
-    } catch (err) {
-      console.error("Lock timeout for raw logging", err);
-    } finally {
-      lock.releaseLock();
-    }
-  }
-
   const context = createServerContext_();
   const m = new MCPA2Aserver();
 
@@ -53,14 +65,14 @@ function main(e) {
   m.apiKey = object.apiKey;
   m.model = object.model;
 
-  // --- Manual Server Overrides ---
+  // Forcefully enable both A2A and MCP routing protocols
   m.a2a = true;
   m.mcp = true;
 
   if (object.accessKey) m.accessKey = object.accessKey;
   if (object.logSpreadsheetId) m.logSpreadsheetId = object.logSpreadsheetId;
 
-  // --- Server-Side History Injection ---
+  // Inject Server-Side Base History for A2A protocols
   m.setHistory([
     {
       role: "user",
@@ -80,24 +92,25 @@ function main(e) {
     },
   ]);
 
-  // Real-time logging callback function
+  // Execution trace logging callback
   const logCallback = (log) => {
     console.log(
       `[${log.level}] ${log.timestamp} (ID: ${log.execId}) - ${log.message}`,
     );
   };
 
+  // Dispatches the request through MCPA2Aserver's robust lifecycle loop
   const res = m.main(e, context, logCallback);
   return res;
 }
 
 /**
- * Returns the Agent Card directly for discovery.
+ * Prints the constructed Agent Card schema cleanly in the console for debug discovery.
  */
 function getAgentCard() {
   const obj = createServerContext_();
   if (!obj.agentCard) {
-    console.error("Agent Card is not defined.");
+    console.error("Error: Agent Card is not defined.");
     return;
   }
   const disp = JSON.stringify(obj.agentCard, null, 2)
@@ -108,8 +121,10 @@ function getAgentCard() {
 }
 
 /**
- * Creates the base context containing definitions for the tools and the agent card.
- * @returns {{ functions: Object, agentCard?: Object }} The unified context.
+ * Creates the unified context mapping defining native tools and server metadata.
+ *
+ * @return {Object} An object structure matching { functions, agentCard }.
+ * @private
  */
 function createServerContext_() {
   const functions = {
@@ -187,7 +202,7 @@ function createServerContext_() {
     },
 
     get_exchange_rate: (object) => {
-      console.log("Run the function get_exchange_rate.");
+      console.log("Executing get_exchange_rate tool...");
       const {
         currency_from = "USD",
         currency_to = "EUR",
@@ -224,7 +239,7 @@ function createServerContext_() {
     },
 
     get_current_weather: (object) => {
-      console.log("Run the function get_current_weather.");
+      console.log("Executing get_current_weather tool...");
       const {
         latitude = "35.681236",
         longitude = "139.767125",
@@ -302,7 +317,7 @@ function createServerContext_() {
     },
 
     chat_and_identity: (object) => {
-      console.log("Run the function chat_and_identity.");
+      console.log("Executing chat_and_identity tool...");
       const res = object.message || "I have processed your chat request.";
 
       const returnObj = {
@@ -323,7 +338,7 @@ function createServerContext_() {
   };
 
   const agentCard = {
-    name: "API Manager",
+    name: "API_Manager",
     description: [
       `Provide management for using various APIs and handle conversational queries.`,
       `- Run with exchange values between various currencies.`,

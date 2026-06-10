@@ -1,30 +1,54 @@
 /**
  * TestSuite_Modular.js
+ * [Production Release v1.3.3]
  *
  * @description
- * Executes a modular test suite for the LlmAgent.
- * Verifies that individual components function correctly without generating redundant "None" tasks.
+ * Complete, execution-ready modular test suite designed to thoroughly validate
+ * all core capabilities of LlmAgent.js under GAS constraints.
+ *
+ * @setup_instructions
+ * 1. Open your Google Apps Script project.
+ * 2. Go to Project Settings (gear icon) -> Script Properties.
+ * 3. Add the following properties:
+ *    - GEMINI_API_KEY: "YOUR_ACTUAL_GEMINI_API_KEY"
+ *    - MCP_SERVER_URL: "https://script.google.com/macros/s/{YOUR_MCP_DEPLOYMENT_ID}/exec?accessKey=sample" (Optional)
+ *    - A2A_SERVER_URL: "https://script.google.com/macros/s/{YOUR_A2A_DEPLOYMENT_ID}/exec?accessKey=sample" (Optional)
+ * 4. Ensure the Google Drive API service is enabled if required, though standard DriveApp is used here.
+ * 5. Run the function `executeModularTestSuite()` from the editor.
+ *
+ * @cleanup_assurance
+ * This script strictly ensures that any temporal Google Drive folders or files
+ * created during the Skill retrieval tests are recursively and definitively
+ * removed inside a robust `finally` block to prevent Drive storage bloat.
  */
 
 function executeModularTestSuite() {
   const { LlmAgent } = GASADK;
 
-  const MCP_SERVER_URL = "YOUR_MCP_SERVER_URL";
-  const A2A_SERVER_URL = "YOUR_A2A_SERVER_URL";
-  const MODEL_NAME = "models/gemini-3-flash-preview";
-
   const properties = PropertiesService.getScriptProperties();
   const API_KEY = properties.getProperty("GEMINI_API_KEY");
 
-  if (!API_KEY)
+  // Retrieve target endpoint URLs if pre-configured
+  const MCP_SERVER_URL =
+    properties.getProperty("MCP_SERVER_URL") || "YOUR_MCP_SERVER_URL";
+  const A2A_SERVER_URL =
+    properties.getProperty("A2A_SERVER_URL") || "YOUR_A2A_SERVER_URL";
+
+  const MODEL_NAME = "models/gemini-3-flash-preview";
+
+  if (!API_KEY) {
     throw new Error(
-      "Critical Failure: GEMINI_API_KEY is not defined in Script Properties.",
+      "CRITICAL FAILURE: GEMINI_API_KEY is not defined in GAS Script Properties.",
     );
+  }
 
   console.log(
     `=== Initiating Modular LlmAgent Test Suite [Model: ${MODEL_NAME}] ===`,
   );
 
+  /**
+   * Diagnostic Core Logger Callback to print internal transition phases.
+   */
   const coreLogger = (logEntry) => {
     console.log(`[Log ${logEntry.timestamp}] ${logEntry.message}`);
     if (logEntry.data && logEntry.data.plan) {
@@ -38,13 +62,42 @@ function executeModularTestSuite() {
     }
   };
 
+  /**
+   * Helper utility to recursively delete files and subfolders within Google Drive.
+   * Definitively cleans up temporary test assets.
+   *
+   * @param {GoogleAppsScript.Drive.Folder} folder - The target folder to clean up.
+   */
+  const cleanupFolderRecursive = (folder) => {
+    if (!folder) return;
+    try {
+      const files = folder.getFiles();
+      while (files.hasNext()) {
+        const file = files.next();
+        file.setTrashed(true);
+      }
+      const subFolders = folder.getFolders();
+      while (subFolders.hasNext()) {
+        cleanupFolderRecursive(subFolders.next());
+      }
+      folder.setTrashed(true);
+    } catch (err) {
+      console.warn(
+        `[Cleanup Warning] Failed to clean Drive assets: ${err.message}`,
+      );
+    }
+  };
+
   const tests = [
+    /**
+     * Test 1: Basic execution and Dynamic State Injection validation.
+     */
     function testBasicAndState() {
       const agent = new LlmAgent({
         apiKey: API_KEY,
         name: "BasicAgent",
         model: MODEL_NAME,
-        instruction: "You are {role}. Reply concisely.",
+        instruction: "You are {role}. Reply concisely in English.",
         state: { role: "a cynical philosopher" },
       }).setServices({
         lock: LockService.getScriptLock(),
@@ -56,6 +109,9 @@ function executeModularTestSuite() {
       console.log("-> Result:", JSON.stringify(agent.run(prompt, coreLogger)));
     },
 
+    /**
+     * Test 2: Native Tool Binding & Execution.
+     */
     function testNativeTools() {
       const agent = new LlmAgent({
         apiKey: API_KEY,
@@ -87,6 +143,9 @@ function executeModularTestSuite() {
       console.log("-> Result:", JSON.stringify(agent.run(prompt, coreLogger)));
     },
 
+    /**
+     * Test 3: Output Schema Interception & Structured Formulation.
+     */
     function testOutputSchema() {
       const agent = new LlmAgent({
         apiKey: API_KEY,
@@ -112,6 +171,9 @@ function executeModularTestSuite() {
       console.log("-> Result:", JSON.stringify(agent.run(prompt, coreLogger)));
     },
 
+    /**
+     * Test 4: Built-in Python Code Executor execution.
+     */
     function testCodeExecutor() {
       const agent = new LlmAgent({
         apiKey: API_KEY,
@@ -130,6 +192,9 @@ function executeModularTestSuite() {
       console.log("-> Result:", JSON.stringify(agent.run(prompt, coreLogger)));
     },
 
+    /**
+     * Test 5: Hierarchical Agent Delegation (SubAgents).
+     */
     function testSubAgents() {
       const translator = new LlmAgent({
         apiKey: API_KEY,
@@ -162,11 +227,17 @@ function executeModularTestSuite() {
       );
     },
 
+    /**
+     * Test 6: Drive-based Agent Skills & Automatic Asset Cleanup.
+     */
     function testAgentSkills() {
-      console.log("Setting up temporary Agent Skills directory...");
+      console.log(
+        "Setting up temporary Agent Skills directory on Google Drive...",
+      );
       const tempFolder = DriveApp.createFolder(
         "Temp_Modular_Skills_" + new Date().getTime(),
       );
+
       try {
         const animalFolder = tempFolder.createFolder("animal_skill");
         animalFolder.createFile(
@@ -195,13 +266,24 @@ function executeModularTestSuite() {
           JSON.stringify(agent.run(prompt, coreLogger)),
         );
       } finally {
-        tempFolder.setTrashed(true);
-        console.log("Temporary skills directory trashed.");
+        // Enforce definitive recursive cleanup of Drive assets to avoid storage leaks
+        cleanupFolderRecursive(tempFolder);
+        console.log(
+          "Temporary skills directory recursively cleaned and moved to trash successfully.",
+        );
       }
     },
 
+    /**
+     * Test 7: Integration with Model Context Protocol (MCP) Server.
+     */
     function testMCPServer() {
-      if (!MCP_SERVER_URL || MCP_SERVER_URL.includes("YOUR_MCP")) return;
+      if (!MCP_SERVER_URL || MCP_SERVER_URL === "YOUR_MCP_SERVER_URL") {
+        console.log(
+          "[Skipping MCP Server Test]: Valid MCP_SERVER_URL is not set.",
+        );
+        return;
+      }
       const agent = new LlmAgent({
         apiKey: API_KEY,
         name: "MCPAgent",
@@ -219,8 +301,16 @@ function executeModularTestSuite() {
       console.log("-> Result:", JSON.stringify(agent.run(prompt, coreLogger)));
     },
 
+    /**
+     * Test 8: Integration with Agent-to-Agent (A2A) Remote Server.
+     */
     function testA2AServer() {
-      if (!A2A_SERVER_URL || A2A_SERVER_URL.includes("YOUR_A2A")) return;
+      if (!A2A_SERVER_URL || A2A_SERVER_URL === "YOUR_A2A_SERVER_URL") {
+        console.log(
+          "[Skipping A2A Server Test]: Valid A2A_SERVER_URL is not set.",
+        );
+        return;
+      }
       const agent = new LlmAgent({
         apiKey: API_KEY,
         name: "A2AAgent",
@@ -245,7 +335,7 @@ function executeModularTestSuite() {
     console.log(`==================================================`);
     try {
       testFn();
-      console.log(`[SUCCESS] ${testFn.name}`);
+      console.log(`[SUCCESS] ${testFn.name} execution completed.`);
     } catch (err) {
       console.error(`[FATAL ERROR] ${testFn.name} failed: ${err.stack}`);
     }

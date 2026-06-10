@@ -30,6 +30,8 @@ At the core of GASADK is the **LlmAgent**, powered by the **Planner-Executor-Syn
    Allows server functions to forcefully bypass the server-side LLM synthesis loop (by returning `_gemini_halt: true`). This prevents endless generative loops, eliminates unnecessary token usage, and guarantees instant response times for purely algorithmic/computational tool executions.
 8. **Direct JSON-RPC Bypass & Direct Routing (v1.3.1)**
    Bypasses the entire multi-phase LLM mock orchestration when `directRouting` is flagged and a single target card is assigned, dispatching the JSON-RPC request natively to slash network latency. It also supports local pre-fetched Agent Cards through `a2aServerAgentCardJSONs` to completely bypass remote HTTP fetches.
+9. **Multi-Channel Log Propagation (v1.3.3)**
+   Supports explicit log propagation from the orchestrator down to sub-clients (`MCPApp` and `A2AApp`), storing logs inside dedicated, isolated Sheets (`raw`, `MCP`, `A2A`, `MCPA2Aserver_log`) dynamically. It guarantees thread-safe writes using script lock protection under high-concurrency environments.
 
 ### GASADK vs. TS ADK (`@google/adk`) Paradigm Shift
 
@@ -228,6 +230,7 @@ The `new LlmAgent(config)` constructor accepts an extensive configuration object
 | `timeoutMs`              | Number        |    No    | Milliseconds before triggering a forced abort to evade the GAS 6-minute kill switch. Defaults to `280000` (280s).    |
 | `maxResultLength`        | Number        |    No    | Maximum allowed string length per execution before truncation. Prevents payload crashes. Defaults to `20000`.        |
 | `outputSchema`           | Object        |    No    | Strict JSON Schema declaration. Forces the Synthesizer to format the output, disabling the direct Fast-Track bypass. |
+| `logSpreadsheetId`       | String        |    No    | Google Spreadsheet ID to activate multi-channel logging. Automatically propagates down to `MCPApp` and `A2AApp`.     |
 
 ### Custom Server Name Routing (v1.3.0+)
 
@@ -285,6 +288,28 @@ const agent = new LlmAgent({
       }
     }
   ]
+});
+```
+
+### Multi-Channel Log Propagation & Auto-Sheet Initialization (v1.3.3+)
+
+From v1.3.3, you can activate thread-safe, multi-channel logging simply by providing a `logSpreadsheetId` in the `LlmAgent` configuration. When configured, this property is automatically propagated down to downstream `MCPApp` and `A2AApp` instances.
+
+The library validates and automatically creates the following isolated sheets inside the designated spreadsheet:
+- **`raw`**: Automatically records serialized raw HTTP event payloads (e.g. GET/POST objects) using safe JSON serialization (`serializeEvent_`) to prevent cyclical structure reference crashes.
+- **`MCP`**: Records Model Context Protocol client-side and server-side RPC log history.
+- **`A2A`**: Records Agent-to-Agent client-side and server-side transaction logging.
+- **`MCPA2Aserver_log`**: Records internal dispatcher execution trails.
+
+All sheet creation and row insertions are protected by thread-safe LockService structures, preventing data loss or layout errors during high-concurrency parallel executions.
+
+#### Example:
+```javascript
+const agent = new LlmAgent({
+  apiKey: API_KEY,
+  logSpreadsheetId: "YOUR_LOG_SPREADSHEET_ID_HERE", // Set the ID here
+  mcpServers: ["https://example.com/mcp-server"],
+  a2aServerAgentCardURLs: ["https://example.com/a2a-server/.well-known/agent-card.json"]
 });
 ```
 
@@ -698,5 +723,12 @@ function test_chat_history() {
 
 - v1.3.2 (June 9, 2026)
   - Updated `GeminiWithFiles` to v2.0.30.
+
+- v1.3.3 (June 10, 2026)
+  - Added Multi-Channel Log Propagation down to `MCPApp` and `A2AApp` via `logSpreadsheetId`.
+  - Automatically creates and isolates logs into dedicated sheets (`raw`, `MCP`, `A2A`, and `MCPA2Aserver_log`) inside the specified log spreadsheet.
+  - Implemented thread-safe `_getOrCreateSheet` helper with LockService validation across `MCPApp`, `A2AApp`, and `MCPA2Aserver` to prevent concurrent sheet insertion conflicts.
+  - Added raw event serialization (`serializeEvent_`) to bypass cyclical structure errors when writing to the `raw` sheet.
+  - Enhanced error traceability by prefixing log and exception messages (e.g. `[MCP Server Error]`, `[A2A Client Error]`).
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)
