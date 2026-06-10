@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v1.3.2] - The Ultimate Autonomous Orchestrator with Custom Server Routing
+ * [Production Release v1.3.3] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -25,11 +25,14 @@
  *   sub-agents, MCP servers, and A2A remote servers without polluting the core logic history.
  * - **Local JSON Bypass (v1.3.1)**: Allows feeding pre-fetched Agent Card JSON objects directly
  *   to bypass redundant HTTP requests, slashing network latency for A2A protocols.
+ * - **Multi-Channel Log Propagation (v1.3.3)**: Supports explicit log propagation from
+ *   the orchestrator down to sub-clients, storing logs inside multi-channel Sheets dynamically.
  *
  * @usage
  * const agent = new LlmAgent({
  *   apiKey: "YOUR_GEMINI_API_KEY",
  *   name: "OrchestratorPrime",
+ *   logSpreadsheetId: "YOUR_LOG_SPREADSHEET_ID",
  *   a2aServerAgentCardURLs: [
  *     "https://script.google.com/macros/s/{deploymentID}/exec"
  *   ],
@@ -83,6 +86,7 @@ var LlmAgent = class LlmAgent {
     // Advanced config
     this.generateContentConfig = config.generateContentConfig || null;
     this.outputSchema = config.outputSchema || null;
+    this.logSpreadsheetId = config.logSpreadsheetId || ""; // Propagated down to MCPApp and A2AApp in v1.3.3
 
     // Internal state
     this.history = [];
@@ -219,7 +223,12 @@ var LlmAgent = class LlmAgent {
     // 2. MCP Servers
     if (this.mcpServers?.length > 0) {
       try {
-        const mcpApp = new MCPApp().setServices(this.services);
+        const mcpConfig = {};
+        if (this.logSpreadsheetId) {
+          mcpConfig.log = true;
+          mcpConfig.spreadsheetId = this.logSpreadsheetId;
+        }
+        const mcpApp = new MCPApp(mcpConfig).setServices(this.services);
         const initClient = mcpApp.client({
           apiKey: this.apiKey,
           prompt: "system_initialization",
@@ -280,7 +289,12 @@ var LlmAgent = class LlmAgent {
     ) {
       try {
         const combinedA2AConfigs = [];
-        const a2aApp = new A2AApp().setServices(this.services);
+        const a2aConfig = { model: this.model };
+        if (this.logSpreadsheetId) {
+          a2aConfig.log = true;
+          a2aConfig.spreadsheetId = this.logSpreadsheetId;
+        }
+        const a2aApp = new A2AApp(a2aConfig).setServices(this.services);
 
         // 3a. Process Remote URLs
         if (this.a2aServerAgentCardURLs?.length > 0) {
@@ -475,7 +489,12 @@ var LlmAgent = class LlmAgent {
         return g.generateContent({ q: executionPrompt });
       }
       case "MCP Server": {
-        const mcpApp = new MCPApp().setServices(this.services);
+        const mcpConfig = {};
+        if (this.logSpreadsheetId) {
+          mcpConfig.log = true;
+          mcpConfig.spreadsheetId = this.logSpreadsheetId;
+        }
+        const mcpApp = new MCPApp(mcpConfig).setServices(this.services);
         const tempClient = mcpApp.client({
           apiKey: this.apiKey,
           prompt: executionPrompt,
@@ -490,9 +509,12 @@ var LlmAgent = class LlmAgent {
       }
       case "A2A Server": {
         // [Optimization v1.3.1]: Pass LlmAgent model settings to A2AApp context natively
-        const a2aApp = new A2AApp({ model: this.model }).setServices(
-          this.services,
-        );
+        const a2aConfig = { model: this.model };
+        if (this.logSpreadsheetId) {
+          a2aConfig.log = true;
+          a2aConfig.spreadsheetId = this.logSpreadsheetId;
+        }
+        const a2aApp = new A2AApp(a2aConfig).setServices(this.services);
         // By passing agentCards directly, A2AApp guarantees a zero-latency HTTP bypass for card fetching.
         // By passing directRouting: true, we cleanly bypass A2AApp's internal local double-planning (Phase 3-7).
         const res = a2aApp.client({
