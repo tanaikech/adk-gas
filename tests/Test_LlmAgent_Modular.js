@@ -1,6 +1,6 @@
 /**
  * TestSuite_Modular.js
- * [Production Release v1.3.3]
+ * [Production Release v1.3.4]
  *
  * @description
  * Complete, execution-ready modular test suite designed to thoroughly validate

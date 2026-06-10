@@ -1,12 +1,13 @@
 /**
  * tests/A2A_MCP_Server.js
- * [Consolidated Generative AI Protocols Server - v1.3.3 Integration]
+ * [Consolidated Generative AI Protocols Server - v1.3.4 Integration]
  *
  * @description
  * A unified server deployment for Google Apps Script handling both Model Context Protocol (MCP)
  * and Agent-to-Agent (A2A) communications.
  *
- * [Key Updates in v1.3.3]:
+ * [Key Updates in v1.3.4]:
+ * - Global Scope Reference Fix: Resolved the compilation ReferenceError by removing unbound variables in `agentCard_ToolsForMCPServer.js` and using shadow cloning in `MCPA2Aserver.js`.
  * - Native Raw Event Logging: The server-side entry points 'doGet' and 'doPost' pass the event 'e'
  *   directly to MCPA2Aserver.main(), which automatically handles raw event serialization to the
  *   "raw" sheet. No duplicate manual logging code is required here.

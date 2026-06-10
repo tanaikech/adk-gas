@@ -1,7 +1,7 @@
 /**
  * MCPA2Aserver: Class Object for Consolidating Generative AI Protocols
  * Author: Tanaike
- * v2.2.0 (Multi-Channel Sheet Logging Update)
+ * v2.2.1 (Global Scope Reference Bug Fix for ToolsForMCPServer Integration)
  * GitHub: https://github.com/tanaikech/MCPA2Aserver-GAS-Library
  *
  * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking,
@@ -692,7 +692,11 @@ var MCPA2Aserver = class MCPA2Aserver {
           { params_: {} },
         );
 
-      agentCard_ToolsForMCPServer.url = this.webAppsUrl;
+      // This dynamically binds the runtime resolved Web App URL to the local context object.
+      const agentCard = {
+        ...agentCard_ToolsForMCPServer,
+        url: this.webAppsUrl,
+      };
       this.addLog_(
         "ToolsForMCPServer context generated successfully.",
         "INFO",
@@ -701,7 +705,7 @@ var MCPA2Aserver = class MCPA2Aserver {
 
       return {
         functions: functions,
-        agentCard: agentCard_ToolsForMCPServer,
+        agentCard: agentCard,
       };
     } catch (err) {
       this.addLog_(

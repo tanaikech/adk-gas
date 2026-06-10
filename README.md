@@ -32,6 +32,8 @@ At the core of GASADK is the **LlmAgent**, powered by the **Planner-Executor-Syn
    Bypasses the entire multi-phase LLM mock orchestration when `directRouting` is flagged and a single target card is assigned, dispatching the JSON-RPC request natively to slash network latency. It also supports local pre-fetched Agent Cards through `a2aServerAgentCardJSONs` to completely bypass remote HTTP fetches.
 9. **Multi-Channel Log Propagation (v1.3.3)**
    Supports explicit log propagation from the orchestrator down to sub-clients (`MCPApp` and `A2AApp`), storing logs inside dedicated, isolated Sheets (`raw`, `MCP`, `A2A`, `MCPA2Aserver_log`) dynamically. It guarantees thread-safe writes using script lock protection under high-concurrency environments.
+10. **Global Scope Initialization Fix (v1.3.4)**
+    Resolves compilation ReferenceError during global script initialization in Google Apps Script by removing unbound variables (`accessKey`, `webAppsUrl`) from the global context of `agentCard_ToolsForMCPServer.js` and instead using runtime shadow cloning for context safety.
 
 ### GASADK vs. TS ADK (`@google/adk`) Paradigm Shift
 
@@ -730,5 +732,10 @@ function test_chat_history() {
   - Implemented thread-safe `_getOrCreateSheet` helper with LockService validation across `MCPApp`, `A2AApp`, and `MCPA2Aserver` to prevent concurrent sheet insertion conflicts.
   - Added raw event serialization (`serializeEvent_`) to bypass cyclical structure errors when writing to the `raw` sheet.
   - Enhanced error traceability by prefixing log and exception messages (e.g. `[MCP Server Error]`, `[A2A Client Error]`).
+
+- v1.3.4 (June 10, 2026)
+  - Resolved ReferenceError during global script compilation in Google Apps Script.
+  - Removed unbound variables `accessKey` and `webAppsUrl` from the global namespace in `agentCard_ToolsForMCPServer.js`.
+  - Implemented runtime shadow cloning in `MCPA2Aserver.js` to dynamically inject the resolved Web App URL context at execution time, ensuring context safety.
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)
