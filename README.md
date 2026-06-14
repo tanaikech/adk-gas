@@ -6,6 +6,10 @@ Welcome to **GASADK**, the ultimate Agent Development Kit (ADK) designed specifi
 
 Operating within the strict constraints of Google Apps Script—specifically the absolute 6-minute execution limit and synchronous blocking networking—demands an architecture that discards the optimistic assumptions of traditional Node.js environments. **GASADK is a highly engineered survival architecture.** Inspired by the `@google/adk`, this initial release of GASADK introduces the heavily optimized **LlmAgent**. It replaces unbounded, recursive ReAct loops with a deterministic, phase-separated orchestration model, fundamentally solving context bloat, execution latency, and API quota exhaustion.
 
+> [!TIP]
+> 🚀 **Looking to turn your Google Workspace APIs into a Model Context Protocol (MCP) server?**  
+> Check out our new sample project: [Google API MCP Server Guide](file:///home/adsam/GitHub/GASADK_GAS_lib/samples/googleapiapp-mcp-server/README.md) to instantly expose all Google Workspace APIs (Sheets, Drive, Docs, Calendar, Gmail, etc.) as dynamic MCP tools.
+
 ---
 
 ## 🌟 Architecture & Key Innovations
@@ -682,6 +686,12 @@ function test_chat_history() {
 }
 ```
 
+### 7. Exposing Google APIs as a Dynamic MCP/A2A Server (via GoogleApiApp)
+
+By combining **GASADK** with the **GoogleApiApp** library, you can build a stateless proxy that dynamically exposes Google Workspace services (Sheets, Drive, Docs, Calendar, Gmail, Slides, etc.) to any LLM-powered agent as local MCP tools.
+
+For the full implementation script and a beginner-friendly setup guide, see:
+👉 **[Google API MCP Server Sample & Setup Guide](file:///home/adsam/GitHub/GASADK_GAS_lib/samples/googleapiapp-mcp-server/README.md)**
 
 ---
 
