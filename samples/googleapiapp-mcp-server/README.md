@@ -95,16 +95,14 @@ You can integrate this MCP server directly into your Antigravity CLI.
 
 1. Locate your local configuration file. For Linux and macOS, it is typically located at:
    `/home/{user name}/.gemini/config/mcp_config.json`
-2. Add the following configuration to the `mcpServers` block.
-   Make sure to update the path to your `/path/to/ggsrun` executable. `ggsrun` acts as a terminal wrapper that tunnels standard I/O streams into the deployed Google Apps Script Web App.
+2. Add the following configuration to the `mcpServers` block. Make sure to replace `{Deployment ID}` with your actual deployment ID.
 
 ```json
 {
   "mcpServers": {
-    "ggsrun-drive-agent": {
-      "command": "/{your path}/ggsrun",
-      "args": ["mcp"]
-    }
+    "gas-webapps_sample": {
+      "serverUrl": "https://script.google.com/macros/s/{Deployment ID}/exec?accessKey=sample",
+    },
   }
 }
 ```
