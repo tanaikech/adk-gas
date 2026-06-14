@@ -8,7 +8,7 @@ Operating within the strict constraints of Google Apps Script—specifically the
 
 > [!TIP]
 > 🚀 **Looking to turn your Google Workspace APIs into a Model Context Protocol (MCP) server?**  
-> Check out our new sample project: [Google API MCP Server Guide](file:///home/adsam/GitHub/GASADK_GAS_lib/samples/googleapiapp-mcp-server/README.md) to instantly expose all Google Workspace APIs (Sheets, Drive, Docs, Calendar, Gmail, etc.) as dynamic MCP tools.
+> Check out our new sample project: [Google API MCP Server Guide](https://github.com/tanaikech/adk-gas/tree/master/samples/googleapiapp-mcp-server) to instantly expose all Google Workspace APIs (Sheets, Drive, Docs, Calendar, Gmail, etc.) as dynamic MCP tools.
 
 ---
 
@@ -691,7 +691,7 @@ function test_chat_history() {
 By combining **GASADK** with the **GoogleApiApp** library, you can build a stateless proxy that dynamically exposes Google Workspace services (Sheets, Drive, Docs, Calendar, Gmail, Slides, etc.) to any LLM-powered agent as local MCP tools.
 
 For the full implementation script and a beginner-friendly setup guide, see:
-👉 **[Google API MCP Server Sample & Setup Guide](file:///home/adsam/GitHub/GASADK_GAS_lib/samples/googleapiapp-mcp-server/README.md)**
+👉 **[Google API MCP Server Sample & Setup Guide](https://github.com/tanaikech/adk-gas/tree/master/samples/googleapiapp-mcp-server)**
 
 ---
 
