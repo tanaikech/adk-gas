@@ -319,6 +319,9 @@ var GasHookManager = class GasHookManager {
     if (hookResult.continue === false) {
       updated.decision = "deny";
       updated.reason = hookResult.reason || "Execution stopped by hook continue=false";
+    } else if (hookResult.decision === "suspend") {
+      updated.decision = "suspend";
+      updated.reason = hookResult.reason || "Execution suspended for human approval.";
     }
 
     return updated;
@@ -449,8 +452,12 @@ var GasHookManager = class GasHookManager {
     const finalResult = { ...currentInput };
     
     const hasDeny = decisions.some(d => d === "deny" || d === "block");
+    const hasSuspend = decisions.some(d => d === "suspend");
     if (hasDeny) {
       finalResult.decision = "deny";
+      finalResult.reason = reasons.filter(r => r).join("\n");
+    } else if (hasSuspend) {
+      finalResult.decision = "suspend";
       finalResult.reason = reasons.filter(r => r).join("\n");
     } else if (decisions.length > 0) {
       finalResult.decision = "allow";
@@ -467,7 +474,7 @@ var GasHookManager = class GasHookManager {
 
 /**
  * LlmAgent.js
- * [Production Release v1.3.5] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
+ * [Production Release v2.0.0] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -558,6 +565,7 @@ var LlmAgent = class LlmAgent {
     this.generateContentConfig = config.generateContentConfig || null;
     this.outputSchema = config.outputSchema || null;
     this.logSpreadsheetId = config.logSpreadsheetId || ""; // Propagated down to MCPApp and A2AApp in v1.3.3
+    this.maxTokensPerSession = config.maxTokensPerSession || null;
 
     // Hooks System
     this.hookManager = new GasHookManager(config.hooks || []);
@@ -568,6 +576,7 @@ var LlmAgent = class LlmAgent {
     this.logs = [];
     this.services = null;
     this.capabilities = [];
+    this.accumulatedTokens = 0;
     this._capabilitiesInitialized = false;
   }
 
@@ -601,7 +610,22 @@ var LlmAgent = class LlmAgent {
     if (mockedResponse && mockedResponse.text !== undefined) {
       text = mockedResponse.text;
     } else {
-      text = new GeminiWithFiles(activeConfig).generateContent({ q: activeQuery });
+      // Force exportTotalTokens to capture token consumption
+      const clientConfig = { ...activeConfig, exportTotalTokens: true };
+      const rawRes = new GeminiWithFiles(clientConfig).generateContent({ q: activeQuery });
+      
+      if (rawRes && typeof rawRes === 'object' && rawRes.returnValue !== undefined) {
+        text = typeof rawRes.returnValue === 'string' ? rawRes.returnValue : JSON.stringify(rawRes.returnValue);
+        const tokens = rawRes.totalTokenCount || 0;
+        this.accumulatedTokens = (this.accumulatedTokens || 0) + tokens;
+        
+        // Quota Safeguard check
+        if (this.maxTokensPerSession && this.accumulatedTokens > this.maxTokensPerSession) {
+          throw new Error(`CRITICAL: Session aborted. Accumulated token count (${this.accumulatedTokens}) exceeded limit (${this.maxTokensPerSession}).`);
+        }
+      } else {
+        text = rawRes;
+      }
     }
 
     // Call AfterModel with request and response details
@@ -991,7 +1015,7 @@ var LlmAgent = class LlmAgent {
     });
   }
 
-  _executeTask(cap, executionPrompt) {
+  _executeTask(cap, executionPrompt, task = null) {
     if (!cap) {
       const config = {
         apiKey: this.apiKey,
@@ -1027,6 +1051,17 @@ var LlmAgent = class LlmAgent {
           
           if (beforeToolRes.decision === "deny" || beforeToolRes.continue === false) {
             throw new Error(`Execution blocked by BeforeTool hook: ${beforeToolRes.reason || "Denied tool execution"}`);
+          } else if (beforeToolRes.decision === "suspend") {
+            // Save state to PropertiesService for Human-in-the-Loop recovery
+            self.suspendedTask = {
+              task: task,
+              args: args,
+              capabilityId: cap.id,
+              toolName: cap.name,
+              executionPrompt: beforeToolRes.executionPrompt || executionPrompt
+            };
+            self.saveState();
+            throw new Error(`SUSPENDED: Execution suspended for human approval. SessionId: ${self.sessionId}`);
           }
           
           // Apply modified arguments if hook returned them
@@ -1110,7 +1145,27 @@ var LlmAgent = class LlmAgent {
         if (typeof cap._agent.setHistory === "function") {
           cap._agent.setHistory([...this.history]);
         }
-        return cap._agent.run(executionPrompt);
+        // Inherit parent hooks security context and limits
+        if (cap._agent) {
+          if (this.hookManager) {
+            cap._agent.hookManager = this.hookManager;
+            cap._agent.sessionId = this.sessionId;
+          }
+          cap._agent.maxTokensPerSession = this.maxTokensPerSession;
+          cap._agent.accumulatedTokens = this.accumulatedTokens;
+        }
+        try {
+          const subRes = cap._agent.run(executionPrompt);
+          if (cap._agent) {
+            this.accumulatedTokens = cap._agent.accumulatedTokens;
+          }
+          return subRes;
+        } catch (err) {
+          if (cap._agent) {
+            this.accumulatedTokens = cap._agent.accumulatedTokens;
+          }
+          throw err;
+        }
       case "Agent Skill": {
         const config = {
           apiKey: this.apiKey,
@@ -1321,9 +1376,11 @@ Instructions:
         );
       }
 
-      let planQueue = [];
-      let taskResults = [];
-      let replanCount = 0;
+      this.planQueue = [];
+      this.taskResults = [];
+      this.replanCount = 0;
+      this.highestTaskId = 0;
+      this.suspendedTask = null;
 
       // ==========================================
       // ZERO-SYNTHESIS BYPASS & SCHEMA INTERCEPTION
@@ -1337,7 +1394,7 @@ Instructions:
           log(
             "One-Pass Fast-Track intercepted: 'outputSchema' is defined. Routing to Synthesis for strict formatting.",
           );
-          taskResults.push({
+          this.taskResults.push({
             task_id: 0,
             capability_used: "None",
             capability_type: "None",
@@ -1395,28 +1452,355 @@ Instructions:
           return agentResult;
         }
       } else {
-        planQueue = planResult.plan || [];
-        const planSummary = planQueue
+        this.planQueue = planResult.plan || [];
+        const planSummary = this.planQueue
           .map((t) => `Task [${t.task_id}]: '${t.capability_id}'`)
           .join("\n");
-        log("Execution Plan Generated:\n" + planSummary, { plan: planQueue });
+        log("Execution Plan Generated:\n" + planSummary, { plan: this.planQueue });
       }
 
-      let highestTaskId = Math.max(...planQueue.map((t) => t.task_id), 0);
+      this.highestTaskId = Math.max(...this.planQueue.map((t) => t.task_id), 0);
 
-      // ==========================================
-      // ADAPTIVE EXECUTION PHASE
-      // ==========================================
-      while (planQueue.length > 0) {
+      return this._runRemainingQueueAndSynthesize(logCallback);
+    } catch (err) {
+      if (err.message && err.message.startsWith("SUSPENDED")) {
+        throw err;
+      }
+      // EXECUTE SessionEnd Hook on error
+      try {
+        const sessionEndRes = this.hookManager.execute("SessionEnd", { 
+          finalAnswer: null, 
+          error: err.message, 
+          prompt: prompt,
+          reason: "error"
+        });
+        if (sessionEndRes.systemMessage) {
+          console.log(`[SessionEnd Hook Message on Error] ${sessionEndRes.systemMessage}`);
+        }
+      } catch (endErr) {
+        console.error(`[HookManager Error] Failed executing SessionEnd hook on error: ${endErr.message}`);
+      }
+      throw err;
+    }
+  }
+
+  saveState() {
+    const stateData = {
+      sessionId: this.sessionId,
+      currentPrompt: this.currentPrompt,
+      history: this.history,
+      accumulatedTokens: this.accumulatedTokens,
+      logs: this.logs,
+      planQueue: this.planQueue || [],
+      taskResults: this.taskResults || [],
+      highestTaskId: this.highestTaskId || 0,
+      replanCount: this.replanCount || 0,
+      suspendedTask: this.suspendedTask || null
+    };
+    if (this.services && this.services.properties) {
+      this.services.properties.setProperty("HITL_STATE_" + this.sessionId, JSON.stringify(stateData));
+    }
+    return stateData;
+  }
+
+  loadState(sessionId) {
+    let stateData = null;
+    if (this.services && this.services.properties) {
+      const dataStr = this.services.properties.getProperty("HITL_STATE_" + sessionId);
+      if (dataStr) {
+        stateData = JSON.parse(dataStr);
+      }
+    }
+    if (!stateData && this.sessionId === sessionId) {
+      stateData = {
+        sessionId: this.sessionId,
+        currentPrompt: this.currentPrompt,
+        history: this.history,
+        accumulatedTokens: this.accumulatedTokens,
+        logs: this.logs,
+        planQueue: this.planQueue,
+        taskResults: this.taskResults,
+        highestTaskId: this.highestTaskId,
+        replanCount: this.replanCount,
+        suspendedTask: this.suspendedTask
+      };
+    }
+    return stateData;
+  }
+
+  resume(sessionId, approvalDecision, approvedArgs = null, logCallback = null) {
+    const stateData = this.loadState(sessionId);
+    if (!stateData) {
+      throw new Error(`CRITICAL: No suspended state found for sessionId: ${sessionId}`);
+    }
+
+    this.sessionId = stateData.sessionId;
+    this.currentPrompt = stateData.currentPrompt;
+    this.history = stateData.history || [];
+    this.accumulatedTokens = stateData.accumulatedTokens || 0;
+    this.logs = stateData.logs || [];
+    this.planQueue = stateData.planQueue || [];
+    this.taskResults = stateData.taskResults || [];
+    this.highestTaskId = stateData.highestTaskId || 0;
+    this.replanCount = stateData.replanCount || 0;
+    this.suspendedTask = stateData.suspendedTask || null;
+
+    if (this.hookManager) {
+      this.hookManager.sessionId = this.sessionId;
+    }
+
+    const log = (message, data = null) => {
+      const entry = { timestamp: new Date().toISOString(), message, data };
+      this.logs.push(entry);
+      if (typeof logCallback === "function") logCallback(entry);
+    };
+
+    log(`Resuming execution for session ${sessionId} with decision: ${approvalDecision}`);
+
+    if (this.suspendedTask) {
+      const susp = this.suspendedTask;
+      this.suspendedTask = null;
+
+      if (this.services && this.services.properties) {
+        this.services.properties.deleteProperty("HITL_STATE_" + sessionId);
+      }
+
+      if (approvalDecision === "allow" || approvalDecision === "approve") {
+        log(`Task [${susp.task ? susp.task.task_id : "unknown"}] approved by human. Executing...`);
+        let finalArgs = approvedArgs !== null ? approvedArgs : susp.args;
+        
+        let rawResultData;
+        let taskError = null;
+        const taskStartTime = Date.now();
+        const cap = this.capabilities.find((c) => c.id === susp.capabilityId);
+
+        try {
+          if (cap && cap.type === "Native Tool") {
+            let result = cap._tool.function(finalArgs);
+            const afterToolRes = this.hookManager.execute("AfterTool", {
+              prompt: this.currentPrompt,
+              toolName: cap.name,
+              tool_name: cap.name,
+              tool_input: finalArgs,
+              tool_response: { result: result },
+              result: result,
+              capability: cap
+            });
+            
+            if (afterToolRes.decision === "deny" || afterToolRes.continue === false) {
+              rawResultData = `[Interception Blocked/Redacted] ${afterToolRes.reason || "Tool output was hidden by hook policy."}`;
+            } else {
+              rawResultData = afterToolRes.result !== undefined ? afterToolRes.result : result;
+              const additionalToolContext = afterToolRes.hookSpecificOutput?.additionalContext || afterToolRes.additionalContext;
+              if (additionalToolContext) {
+                rawResultData = rawResultData + "\n\n[Hook Context]:\n" + additionalToolContext;
+              }
+            }
+          } else {
+            rawResultData = this._executeTask(cap, susp.executionPrompt, susp.task);
+            const afterToolRes = this.hookManager.execute("AfterTool", {
+              prompt: this.currentPrompt,
+              toolName: cap ? cap.name : susp.capabilityId,
+              capabilityId: susp.capabilityId,
+              result: rawResultData,
+              task: susp.task,
+              capability: cap
+            });
+            
+            if (afterToolRes.decision === "deny" || afterToolRes.continue === false) {
+              rawResultData = `[Interception Blocked/Redacted] ${afterToolRes.reason || "Tool output was hidden by hook policy."}`;
+            } else {
+              rawResultData = afterToolRes.result !== undefined ? afterToolRes.result : rawResultData;
+              const additionalToolContext = afterToolRes.hookSpecificOutput?.additionalContext || afterToolRes.additionalContext;
+              if (additionalToolContext) {
+                rawResultData = rawResultData + "\n\n[Hook Context]:\n" + additionalToolContext;
+              }
+            }
+          }
+        } catch (err) {
+          taskError = err.message;
+        }
+
+        const durationMs = Date.now() - taskStartTime;
+
+        if (!taskError) {
+          let resultStr = typeof rawResultData === "object" ? JSON.stringify(rawResultData) : String(rawResultData);
+          if (resultStr.length > this.maxResultLength) {
+            log(`[PAYLOAD WARNING] Task result length exceeded limit. Truncating.`);
+            resultStr = resultStr.substring(0, this.maxResultLength) + "\n\n...[TRUNCATED: Exceeds context limit]";
+          }
+          this.taskResults.push({
+            task_id: susp.task ? susp.task.task_id : 0,
+            capability_used: susp.capabilityId,
+            capability_type: cap ? cap.type : "Unknown",
+            prompt: susp.task ? susp.task.execution_prompt : susp.executionPrompt,
+            result: resultStr,
+            duration_ms: durationMs,
+          });
+          log(`Task completed successfully in resume phase.`);
+        } else {
+          this.taskResults.push({
+            task_id: susp.task ? susp.task.task_id : 0,
+            capability_used: susp.capabilityId,
+            capability_type: cap ? cap.type : "Unknown",
+            prompt: susp.task ? susp.task.execution_prompt : susp.executionPrompt,
+            error: taskError,
+            duration_ms: durationMs,
+          });
+          log(`Task failed in resume phase: ${taskError}`);
+          
+          if (this.replanCount < this.maxReplans) {
+            this.replanCount++;
+            log(`[DYNAMIC RE-PLANNING] Re-planning in resume phase...`);
+            this.planQueue.length = 0;
+            const activeCapabilities = this.capabilities.map((c) => ({
+              id: c.id,
+              type: c.type,
+              name: c.name,
+              description: c.description,
+            }));
+            const replanPromptStr = `
+[SYSTEM PRIORITY OVERRIDE] Re-plan remaining steps due to failure.
+Original Prompt: "${this.currentPrompt}"
+Capabilities: ${JSON.stringify(activeCapabilities, null, 2)}
+Successful Tasks: ${JSON.stringify(this.taskResults.filter((t) => !t.error), null, 2)}
+
+FAILURE REPORT:
+Failed Capability: ${susp.capabilityId}
+Error: ${taskError}
+
+Instructions:
+1. Bypass the error. Do NOT use the exact same capability/prompt combination.
+2. Decompose remaining work into sequential tasks strictly starting from task_id: ${this.highestTaskId + 1}.
+`;
+            try {
+              const taskArraySchema = {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    task_id: { type: "number" },
+                    description: { type: "string" },
+                    capability_id: { type: "string" },
+                    execution_prompt: { type: "string" },
+                    depends_on: { type: "array", items: { type: "number" } },
+                  },
+                  required: ["task_id", "description", "capability_id", "execution_prompt", "depends_on"],
+                }
+              };
+              const replanConfig = {
+                apiKey: this.apiKey,
+                model: this.model,
+                history: this.history,
+                responseSchema: taskArraySchema,
+              };
+              const replanResText = this._generateContent(replanConfig, replanPromptStr);
+              const newPlan = this._extractJson(replanResText);
+              this.planQueue.push(...newPlan);
+              this.highestTaskId = Math.max(this.highestTaskId, ...newPlan.map((t) => t.task_id));
+            } catch (replanErr) {
+              log(`Re-planning failed in resume phase: ${replanErr.message}`);
+            }
+          }
+        }
+      } else {
+        log(`Task approved decision denied: ${approvalDecision}`);
+        this.taskResults.push({
+          task_id: susp.task ? susp.task.task_id : 0,
+          capability_used: susp.capabilityId,
+          capability_type: "Unknown",
+          prompt: susp.task ? susp.task.execution_prompt : susp.executionPrompt,
+          error: `Execution denied by human decision: ${approvalDecision}`,
+          duration_ms: 0
+        });
+
+        if (this.replanCount < this.maxReplans) {
+          this.replanCount++;
+          log(`[DYNAMIC RE-PLANNING] Re-planning after human denial...`);
+          this.planQueue.length = 0;
+          const activeCapabilities = this.capabilities.map((c) => ({
+            id: c.id,
+            type: c.type,
+            name: c.name,
+            description: c.description,
+          }));
+          const replanPromptStr = `
+[SYSTEM PRIORITY OVERRIDE] Re-plan remaining steps due to human execution denial.
+Original Prompt: "${this.currentPrompt}"
+Capabilities: ${JSON.stringify(activeCapabilities, null, 2)}
+Successful Tasks: ${JSON.stringify(this.taskResults.filter((t) => !t.error), null, 2)}
+
+FAILURE REPORT:
+Failed Capability: ${susp.capabilityId}
+Error: Execution denied by human.
+
+Instructions:
+1. Do NOT use the denied capability/prompt combination. Try to find alternative capabilities.
+2. Decompose remaining work into sequential tasks strictly starting from task_id: ${this.highestTaskId + 1}.
+`;
+          try {
+            const taskArraySchema = {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  task_id: { type: "number" },
+                  description: { type: "string" },
+                  capability_id: { type: "string" },
+                  execution_prompt: { type: "string" },
+                  depends_on: { type: "array", items: { type: "number" } },
+                },
+                required: ["task_id", "description", "capability_id", "execution_prompt", "depends_on"],
+              }
+            };
+            const replanConfig = {
+              apiKey: this.apiKey,
+              model: this.model,
+              history: this.history,
+              responseSchema: taskArraySchema,
+            };
+            const replanResText = this._generateContent(replanConfig, replanPromptStr);
+            const newPlan = this._extractJson(replanResText);
+            this.planQueue.push(...newPlan);
+            this.highestTaskId = Math.max(this.highestTaskId, ...newPlan.map((t) => t.task_id));
+          } catch (replanErr) {
+            log(`Re-planning failed in resume phase after denial: ${replanErr.message}`);
+          }
+        }
+      }
+    }
+
+    return this._runRemainingQueueAndSynthesize(logCallback);
+  }
+
+  _runRemainingQueueAndSynthesize(logCallback = null) {
+    const log = (message, data = null) => {
+      const entry = { timestamp: new Date().toISOString(), message, data };
+      this.logs.push(entry);
+      const notifyRes = this.hookManager.execute("Notification", { 
+        message, 
+        data, 
+        toolName: data?.capability_id || "",
+        notification_type: "Log",
+        details: data
+      });
+      if (notifyRes.systemMessage && typeof logCallback === "function") {
+        logCallback({ timestamp: new Date().toISOString(), message: `[Hook Notification Message] ${notifyRes.systemMessage}`, data });
+      }
+      if (typeof logCallback === "function") logCallback(entry);
+    };
+
+    const prompt = this.currentPrompt;
+
+    try {
+      while (this.planQueue.length > 0) {
         const timeElapsed = Date.now() - this.startTime;
         if (timeElapsed > this.timeoutMs) {
-          log(
-            `[TIMEOUT PREVENTION] Safe abort triggered. Elapsed: ${timeElapsed}ms exceeds ${this.timeoutMs}ms limit.`,
-          );
+          log(`[TIMEOUT PREVENTION] Safe abort triggered. Elapsed: ${timeElapsed}ms exceeds ${this.timeoutMs}ms limit.`);
           break;
         }
 
-        const task = planQueue.shift();
+        const task = this.planQueue.shift();
         log(`Executing Task [${task.task_id}] via [${task.capability_id}]`, {
           description: task.description,
         });
@@ -1425,7 +1809,7 @@ Instructions:
 
         let contextStr = "";
         if (task.depends_on && task.depends_on.length > 0) {
-          const dependentResults = taskResults.filter(
+          const dependentResults = this.taskResults.filter(
             (tr) => task.depends_on.includes(tr.task_id) && !tr.error,
           );
           if (dependentResults.length > 0)
@@ -1453,15 +1837,30 @@ Instructions:
         if (beforeToolRes.decision === "deny") {
           taskError = `Execution blocked by BeforeTool hook: ${beforeToolRes.reason || "Denied tool execution"}`;
           retries = -1; // Prevent retry loop
+        } else if (beforeToolRes.decision === "suspend") {
+          this.suspendedTask = {
+            task: task,
+            args: null,
+            capabilityId: task.capability_id,
+            executionPrompt: beforeToolRes.executionPrompt || finalExecutionPrompt
+          };
+          this.saveState();
+          throw new Error(`SUSPENDED: Execution suspended for human approval. SessionId: ${this.sessionId}`);
         } else {
           const activeExecutionPrompt = beforeToolRes.executionPrompt || finalExecutionPrompt;
 
           while (retries >= 0) {
             try {
-              rawResultData = this._executeTask(cap, activeExecutionPrompt);
+              rawResultData = this._executeTask(cap, activeExecutionPrompt, task);
+              if (this.suspendedTask) {
+                throw new Error(`SUSPENDED: Execution suspended for human approval. SessionId: ${this.sessionId}`);
+              }
               taskError = null;
               break;
             } catch (err) {
+              if (err.message && err.message.startsWith("SUSPENDED")) {
+                throw err;
+              }
               if (retries === 0) {
                 taskError = err.message;
               } else {
@@ -1516,7 +1915,7 @@ Instructions:
         }
 
         if (!taskError) {
-          taskResults.push({
+          this.taskResults.push({
             task_id: task.task_id,
             capability_used: task.capability_id,
             capability_type: cap ? cap.type : "Unknown",
@@ -1528,7 +1927,7 @@ Instructions:
             `Task [${task.task_id}] completed successfully in ${durationMs}ms.`,
           );
         } else {
-          taskResults.push({
+          this.taskResults.push({
             task_id: task.task_id,
             capability_used: task.capability_id,
             capability_type: cap ? cap.type : "Unknown",
@@ -1541,19 +1940,25 @@ Instructions:
           });
 
           // Dynamic Re-Planning Trigger
-          if (replanCount < this.maxReplans) {
-            replanCount++;
+          if (this.replanCount < this.maxReplans) {
+            this.replanCount++;
             log(
-              `[DYNAMIC RE-PLANNING] Attempt ${replanCount}/${this.maxReplans}. Discarding remaining queue and regenerating DAG...`,
+              `[DYNAMIC RE-PLANNING] Attempt ${this.replanCount}/${this.maxReplans}. Discarding remaining queue and regenerating DAG...`,
             );
-            planQueue.length = 0;
+            this.planQueue.length = 0;
 
+            const activeCapabilities = this.capabilities.map((c) => ({
+              id: c.id,
+              type: c.type,
+              name: c.name,
+              description: c.description,
+            }));
             const replanPromptStr = `
 [SYSTEM PRIORITY OVERRIDE] Re-plan remaining steps due to failure.
 Original Prompt: "${prompt}"
 Capabilities: ${JSON.stringify(activeCapabilities, null, 2)}
 Successful Tasks: ${JSON.stringify(
-              taskResults.filter((t) => !t.error),
+              this.taskResults.filter((t) => !t.error),
               null,
               2,
             )}
@@ -1564,19 +1969,43 @@ Error: ${taskError}
 
 Instructions:
 1. Bypass the error. Do NOT use the exact same capability/prompt combination.
-2. Decompose remaining work into sequential tasks strictly starting from task_id: ${highestTaskId + 1}.
+2. Decompose remaining work into sequential tasks strictly starting from task_id: ${this.highestTaskId + 1}.
 `;
             try {
-              // Re-planner explicitly uses the Array Schema
+              const taskArraySchema = {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    task_id: { type: "number" },
+                    description: { type: "string" },
+                    capability_id: { type: "string" },
+                    execution_prompt: { type: "string" },
+                    depends_on: {
+                      type: "array",
+                      items: { type: "number" },
+                    },
+                  },
+                  required: [
+                    "task_id",
+                    "description",
+                    "capability_id",
+                    "execution_prompt",
+                    "depends_on",
+                  ],
+                },
+              };
               const replanConfig = {
-                ...plannerConfig,
+                apiKey: this.apiKey,
+                model: this.model,
+                history: this.history,
                 responseSchema: taskArraySchema,
               };
               const replanResText = this._generateContent(replanConfig, replanPromptStr);
               const newPlan = this._extractJson(replanResText);
-              planQueue.push(...newPlan);
-              highestTaskId = Math.max(
-                highestTaskId,
+              this.planQueue.push(...newPlan);
+              this.highestTaskId = Math.max(
+                this.highestTaskId,
                 ...newPlan.map((t) => t.task_id),
               );
               log("Re-planning successful. Appended new tasks to queue.", {
@@ -1609,7 +2038,7 @@ Instructions:
 Original User Prompt: "${prompt}"
 
 Gathered Execution Data:
-${JSON.stringify(taskResults, null, 2)}
+${JSON.stringify(this.taskResults, null, 2)}
 ${timeWarning}
 
 Objective:
@@ -1617,6 +2046,17 @@ Objective:
 2. If tasks partially failed, transparently state what succeeded and what could not be completed.
 3. CRITICAL: Append an "Execution Summary" at the very end of your response detailing the capabilities used, execution order, duration (ms), and prompts. If no capabilities were used, explicitly state "NO capabilities were used".
 `;
+
+      const temporalContext = `\n[System Time Anchor]: Current system date/time is ${new Date().toString()}. Use this as the baseline for relative time references.`;
+      let globalInstruction = `You are an autonomous orchestrator agent. Designation: "${this.name}".${temporalContext}\n`;
+      let baseInstruction = this.instruction;
+      if (this.state && typeof baseInstruction === "string") {
+        baseInstruction = baseInstruction.replace(/{(\w+)}/g, (match, key) =>
+          this.state[key] !== undefined ? this.state[key] : match,
+        );
+      }
+      if (baseInstruction)
+        globalInstruction += `User Persona & Core Instructions: ${typeof baseInstruction === "string" ? baseInstruction : JSON.stringify(baseInstruction)}\n`;
 
       const synthConfig = {
         apiKey: this.apiKey,
@@ -1685,6 +2125,9 @@ Objective:
 
       return agentResult;
     } catch (err) {
+      if (err.message && err.message.startsWith("SUSPENDED")) {
+        throw err;
+      }
       // EXECUTE SessionEnd Hook on error
       try {
         const sessionEndRes = this.hookManager.execute("SessionEnd", { 

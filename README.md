@@ -808,6 +808,92 @@ const agent = new LlmAgent({
 
 When the agent runs, any attempt to call `gmail_send_email` with an external domain, or `drive_delete_file` with the protected ID will be immediately intercepted and blocked.
 
+### 🔄 Human-in-the-Loop (HITL) & Resumption (v2.0.0+)
+
+GASADK v2.0.0 introduces Human-in-the-Loop (HITL) capability. When a hook function returns a decision of `"suspend"`, the agent immediately saves its execution state (including prompt, plan, task results, history, and log traces) to script properties under `HITL_STATE_[sessionId]`, then aborts the loop by throwing a `"SUSPENDED"` exception.
+
+This allows developers to pause execution, solicit user confirmation (e.g., via Email, Slack, or a Web App form), and resume execution from the exact task that was suspended.
+
+#### 1. Defining a Suspension Hook
+Return `decision: "suspend"` inside a `BeforeTool` hook to request human approval:
+
+```javascript
+function checkGmailApproval(input) {
+  if (input.tool_name === "gmail_send_email") {
+    // Suspend execution for human review
+    return {
+      decision: "suspend",
+      reason: "Requires human review before sending email to " + (input.tool_input?.to || "recipient")
+    };
+  }
+  return { decision: "allow" };
+}
+```
+
+#### 2. Catching the Suspension and Resuming
+Run the agent, catch the suspension, and resume later using the `resume()` method:
+
+```javascript
+const agent = new LlmAgent({
+  apiKey: API_KEY,
+  name: "ApprovalAgent",
+  hooks: {
+    "BeforeTool": [
+      {
+        "matcher": "gmail_send_email",
+        "type": "gas_function",
+        "functionName": "checkGmailApproval"
+      }
+    ]
+  },
+  tools: [...]
+}).setServices({
+  lock: LockService.getScriptLock(),
+  properties: PropertiesService.getScriptProperties(),
+  globalContext: this // Exposes checkGmailApproval
+});
+
+const sessionId = agent.sessionId;
+
+try {
+  agent.run("Use gmail_send_email to email boss@mycompany.com");
+} catch (err) {
+  if (err.message.includes("SUSPENDED")) {
+    console.log("Execution suspended. Session ID: " + sessionId);
+    // Send approval link/email to human
+  } else {
+    throw err;
+  }
+}
+
+// --- Later (e.g. from a Web App doGet/doPost approval trigger) ---
+function approveSession(sessionId) {
+  const resumeAgent = new LlmAgent({
+    apiKey: API_KEY,
+    name: "ApprovalAgent",
+    tools: [...]
+  }).setServices({
+    lock: LockService.getScriptLock(),
+    properties: PropertiesService.getScriptProperties()
+  });
+
+  // Resume execution with 'allow' decision
+  const result = resumeAgent.resume(sessionId, "allow");
+  console.log("Resumed Final Result: " + result);
+}
+```
+
+### 📊 API Quota Safeguards & Token Accumulation (v2.0.0+)
+
+To prevent runaway loops or budget overrun, GASADK automatically tracks token usage per session. You can enforce a strict token limit using the `maxTokensPerSession` option.
+
+```javascript
+const agent = new LlmAgent({
+  apiKey: API_KEY,
+  maxTokensPerSession: 50000 // Limit session to 50k tokens
+});
+```
+
 ## Author
 
 [Tanaike](https://tanaikech.github.io/about/)
@@ -868,5 +954,8 @@ When the agent runs, any attempt to call `gmail_send_email` with an external dom
   - Exposed Google Workspace APIs as a Dynamic MCP/A2A Server.
   - Added a standalone deployment script (`DeployMcpServer.js`) under `samples/googleapiapp-mcp-server` to expose the GoogleApiApp library.
   - Created a detailed beginner-friendly guide for configuring and deploying Google Workspace services (Sheets, Drive, Docs, Calendar, Gmail, etc.) as dynamic MCP tools.
+  - Added API Quota Safeguard: Track model token consumption per session and enforce session-level token usage limit check via `maxTokensPerSession` configuration.
+  - Added Hook & Session Propagation: Automatically propagate parent hooks security context (`hookManager` and `sessionId`) and token constraints down to child sub-agents during hierarchical delegation.
+  - Added Human-in-the-Loop (HITL) Integration: Supported `decision: "suspend"` decisions in BeforeTool hooks. Seamlessly serializes and stores task state to `PropertiesService` (under `HITL_STATE_[sessionId]`) and throws a `"SUSPENDED"` exception. Added `saveState()`, `loadState(sessionId)`, and `resume(sessionId, decision, approvedArgs)` methods to recover and run suspended agent execution loops.
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)

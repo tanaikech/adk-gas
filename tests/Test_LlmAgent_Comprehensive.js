@@ -263,6 +263,129 @@ function executeComprehensiveTestSuite() {
         }
       }
     });
+
+    // ==========================================
+    // INTEGRATED COMPREHENSIVE V2.0 CAPABILITIES TEST
+    // ==========================================
+    console.log("\n==================================================");
+    console.log("   [V2.0 Capability]: Integrated Token Safeguard & HITL");
+    console.log("==================================================");
+
+    // Test token safeguard
+    console.log("\n--- Testing Quota Safeguard ---");
+    const quotaAgent = new LlmAgent({
+      apiKey: API_KEY,
+      name: "CompQuotaAgent",
+      model: MODEL_NAME,
+      maxTokensPerSession: 50
+    }).setServices({
+      lock: LockService.getScriptLock(),
+      properties: properties,
+    });
+    try {
+      quotaAgent.run("Write a very long poem about autonomous agent software development containing at least 200 words to intentionally blow past the 50 token limit.", traceLogger);
+      console.error("FAIL: Integrated Token quota safeguard did not trigger.");
+    } catch (err) {
+      if (err.message.includes("exceeded limit")) {
+        console.log("[Assert OK] Integrated token safeguard triggered correctly: " + err.message);
+      } else {
+        throw err;
+      }
+    }
+
+    // Test HITL Suspend & Resume with global function hook matcher
+    console.log("\n--- Testing HITL Suspend & Resume ---");
+    this.compHitlHook = function(input) {
+      console.log("   >> [Comprehensive HITL Hook] Checking tool: " + input.toolName);
+      if (input.toolName === "get_server_status") {
+        return { decision: "suspend", reason: "Server status request requires authorization." };
+      }
+      return { decision: "allow" };
+    };
+
+    const compHitlAgent = new LlmAgent({
+      apiKey: API_KEY,
+      name: "CompHitlAgent",
+      model: MODEL_NAME,
+      instruction: "You check server status.",
+      tools: [
+        {
+          name: "get_server_status",
+          description: "Get server status.",
+          parameters: { type: "object", properties: { node: { type: "string" } } },
+          function: (args) => `Node ${args.node} is active.`
+        }
+      ],
+      hooks: {
+        "BeforeTool": [
+          {
+            "matcher": "get_server_status",
+            "type": "gas_function",
+            "functionName": "compHitlHook"
+          }
+        ]
+      }
+    }).setServices({
+      lock: LockService.getScriptLock(),
+      properties: properties,
+      globalContext: this
+    });
+
+    compHitlAgent.sessionId = "comp_hitl_session_999";
+    if (compHitlAgent.hookManager) {
+      compHitlAgent.hookManager.sessionId = "comp_hitl_session_999";
+    }
+
+    properties.deleteProperty("HITL_STATE_comp_hitl_session_999");
+
+    try {
+      compHitlAgent.run("Use get_server_status tool to check status of node Alpha.", traceLogger);
+      throw new Error("FAIL: CompHitlAgent completed execution instead of suspending.");
+    } catch (err) {
+      if (err.message && err.message.includes("SUSPENDED")) {
+        console.log("[Assert OK] Suspended exception thrown: " + err.message);
+      } else {
+        throw err;
+      }
+    }
+
+    // Verify properties state saved
+    const compSavedState = properties.getProperty("HITL_STATE_comp_hitl_session_999");
+    if (!compSavedState) {
+      throw new Error("FAIL: Comprehensive saved state not found in PropertiesService.");
+    }
+    console.log("[Assert OK] State successfully serialized in properties.");
+
+    // Resume
+    const compResumeAgent = new LlmAgent({
+      apiKey: API_KEY,
+      name: "CompHitlAgent",
+      model: MODEL_NAME,
+      instruction: "You check server status.",
+      tools: [
+        {
+          name: "get_server_status",
+          description: "Get server status.",
+          parameters: { type: "object", properties: { node: { type: "string" } } },
+          function: (args) => `Node ${args.node} is active.`
+        }
+      ]
+    }).setServices({
+      lock: LockService.getScriptLock(),
+      properties: properties,
+      globalContext: this
+    });
+
+    compResumeAgent._initializeCapabilities();
+    const compResumeRes = compResumeAgent.resume("comp_hitl_session_999", "allow", null, traceLogger);
+    console.log("Resumed Result:", compResumeRes);
+    if (!compResumeRes.includes("active")) {
+      throw new Error("FAIL: Comprehensive resumption did not complete status check.");
+    }
+    console.log("[Assert OK] Comprehensive resumption executed and finished successfully.");
+
+    delete this.compHitlHook;
+
   } finally {
     console.log(
       "\nCommencing cleanup protocol. Trashing temporary Agent Skills infrastructure...",

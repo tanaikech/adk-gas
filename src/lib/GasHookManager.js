@@ -319,6 +319,9 @@ var GasHookManager = class GasHookManager {
     if (hookResult.continue === false) {
       updated.decision = "deny";
       updated.reason = hookResult.reason || "Execution stopped by hook continue=false";
+    } else if (hookResult.decision === "suspend") {
+      updated.decision = "suspend";
+      updated.reason = hookResult.reason || "Execution suspended for human approval.";
     }
 
     return updated;
@@ -449,8 +452,12 @@ var GasHookManager = class GasHookManager {
     const finalResult = { ...currentInput };
     
     const hasDeny = decisions.some(d => d === "deny" || d === "block");
+    const hasSuspend = decisions.some(d => d === "suspend");
     if (hasDeny) {
       finalResult.decision = "deny";
+      finalResult.reason = reasons.filter(r => r).join("\n");
+    } else if (hasSuspend) {
+      finalResult.decision = "suspend";
       finalResult.reason = reasons.filter(r => r).join("\n");
     } else if (decisions.length > 0) {
       finalResult.decision = "allow";

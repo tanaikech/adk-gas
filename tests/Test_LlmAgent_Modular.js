@@ -327,6 +327,216 @@ function executeModularTestSuite() {
       console.log(`-> Prompt: ${prompt}`);
       console.log("-> Result:", JSON.stringify(agent.run(prompt, coreLogger)));
     },
+
+    /**
+     * Test 9: API Quota Safeguard (Token Accumulation and Limits)
+     */
+    function testTokenSafeguard() {
+      console.log("Testing Token Safeguard...");
+      const agent = new LlmAgent({
+        apiKey: API_KEY,
+        name: "QuotaAgent",
+        model: MODEL_NAME,
+        instruction: "Reply with exactly one word.",
+        maxTokensPerSession: 5 // Extremely low limit to trigger safeguard
+      }).setServices({
+        lock: LockService.getScriptLock(),
+        properties: properties,
+      });
+
+      try {
+        agent.run("Hello there!", coreLogger);
+        agent.run("This is a longer prompt designed to consume more than five tokens in total.", coreLogger);
+        throw new Error("FAIL: Token quota safeguard did not trigger.");
+      } catch (err) {
+        if (err.message.includes("exceeded limit")) {
+          console.log("[Assert OK] Token quota safeguard triggered correctly: " + err.message);
+        } else {
+          throw err;
+        }
+      }
+    },
+
+    /**
+     * Test 10: Human-in-the-Loop (HITL) Suspension & Resumption
+     */
+    function testHitlResume() {
+      console.log("Testing HITL Suspension and Resumption...");
+      
+      const propertiesMock = properties;
+      propertiesMock.deleteProperty("HITL_STATE_test_hitl_session");
+
+      globalThis.testHitlSuspendHook = function(input) {
+        console.log("   >> [HITL Hook] Intercepted tool: " + input.toolName);
+        return { decision: "suspend", reason: "Requires human review." };
+      };
+
+      const agent = new LlmAgent({
+        apiKey: API_KEY,
+        name: "HitlAgent",
+        model: MODEL_NAME,
+        instruction: "You are a helpful assistant.",
+        hooks: {
+          "BeforeTool": [
+            {
+              "matcher": "get_weather",
+              "type": "gas_function",
+              "functionName": "testHitlSuspendHook"
+            }
+          ]
+        },
+        tools: [
+          {
+            name: "get_weather",
+            description: "Get the current weather for a city.",
+            parameters: {
+              type: "object",
+              properties: { city: { type: "string" } },
+              required: ["city"]
+            },
+            function: (args) => `The weather in ${args.city} is sunny.`
+          }
+        ]
+      }).setServices({
+        lock: LockService.getScriptLock(),
+        properties: propertiesMock,
+        globalContext: globalThis
+      });
+
+      agent.sessionId = "test_hitl_session";
+      if (agent.hookManager) {
+        agent.hookManager.sessionId = "test_hitl_session";
+      }
+
+      let suspendedSessionId = null;
+      try {
+        console.log("Running prompt that triggers get_weather tool...");
+        agent.run("Use get_weather to check the weather in Tokyo.", coreLogger);
+        throw new Error("FAIL: Agent completed execution instead of suspending.");
+      } catch (err) {
+        if (err.message && err.message.startsWith("SUSPENDED")) {
+          console.log("[Assert OK] Suspended exception thrown successfully: " + err.message);
+          suspendedSessionId = agent.sessionId;
+        } else {
+          throw err;
+        }
+      }
+
+      const savedStateStr = propertiesMock.getProperty("HITL_STATE_" + suspendedSessionId);
+      if (!savedStateStr) {
+        throw new Error("FAIL: No state was saved in PropertiesService.");
+      }
+      console.log("[Assert OK] State was successfully serialized and saved.");
+
+      console.log("Resuming execution with 'allow' decision...");
+      const resumeAgent = new LlmAgent({
+        apiKey: API_KEY,
+        name: "HitlAgent",
+        model: MODEL_NAME,
+        instruction: "You are a helpful assistant.",
+        tools: [
+          {
+            name: "get_weather",
+            description: "Get the weather.",
+            parameters: {
+              type: "object",
+              properties: { city: { type: "string" } },
+              required: ["city"]
+            },
+            function: (args) => `The weather in ${args.city} is sunny.`
+          }
+        ]
+      }).setServices({
+        lock: LockService.getScriptLock(),
+        properties: propertiesMock,
+        globalContext: globalThis
+      });
+
+      resumeAgent._initializeCapabilities();
+
+      const finalResult = resumeAgent.resume(suspendedSessionId, "allow", null, coreLogger);
+      console.log("Resumed Final Result:", finalResult);
+      if (!finalResult.includes("sunny")) {
+        throw new Error("FAIL: Resumed execution did not complete the get_weather task correctly.");
+      }
+      console.log("[Assert OK] Resumed execution completed successfully.");
+
+      const cleanedProperty = propertiesMock.getProperty("HITL_STATE_" + suspendedSessionId);
+      if (cleanedProperty) {
+        throw new Error("FAIL: State property was not deleted after resumption.");
+      }
+      console.log("[Assert OK] Saved state property cleaned up successfully.");
+      
+      delete globalThis.testHitlSuspendHook;
+    },
+
+    /**
+     * Test 11: SubAgent Context & Hook Propagation
+     */
+    function testSubAgentHookPropagation() {
+      console.log("Testing SubAgent Hook Propagation...");
+      
+      let hookCount = 0;
+      globalThis.testSubAgentHook = function(input) {
+        console.log("   >> [SubAgent Hook] BeforeTool hook called for: " + input.toolName + " in session " + input.session_id);
+        hookCount++;
+        return { decision: "allow" };
+      };
+
+      const childAgent = new LlmAgent({
+        apiKey: API_KEY,
+        name: "ChildAgent",
+        description: "Executes a secret tool.",
+        model: MODEL_NAME,
+        tools: [
+          {
+            name: "secret_tool",
+            description: "Run secret logic.",
+            parameters: { type: "object", properties: {} },
+            function: () => "Secrets revealed!"
+          }
+        ]
+      }).setServices({
+        lock: LockService.getScriptLock(),
+        properties: properties,
+      });
+
+      const parentAgent = new LlmAgent({
+        apiKey: API_KEY,
+        name: "ParentAgent",
+        model: MODEL_NAME,
+        hooks: {
+          "BeforeTool": [
+            {
+              "matcher": "secret_tool",
+              "type": "gas_function",
+              "functionName": "testSubAgentHook"
+            }
+          ]
+        },
+        subAgents: [childAgent]
+      }).setServices({
+        lock: LockService.getScriptLock(),
+        properties: properties,
+        globalContext: globalThis
+      });
+
+      parentAgent.sessionId = "parent_prop_session_123";
+      if (parentAgent.hookManager) {
+        parentAgent.hookManager.sessionId = "parent_prop_session_123";
+      }
+
+      console.log("Running parent agent prompting sub-agent...");
+      const result = parentAgent.run("Use the SubAgent named 'ChildAgent' to execute the 'secret_tool' tool and report the result.", coreLogger);
+      console.log("Parent result:", result);
+
+      if (hookCount === 0) {
+        throw new Error("FAIL: Parent BeforeTool hook was not called during sub-agent tool execution.");
+      }
+      console.log("[Assert OK] Hook propagated to sub-agent successfully. Hook invocation count: " + hookCount);
+
+      delete globalThis.testSubAgentHook;
+    },
   ];
 
   tests.forEach((testFn, idx) => {
