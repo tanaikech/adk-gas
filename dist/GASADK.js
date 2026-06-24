@@ -7457,8 +7457,8 @@ var MCPA2Aserver = class MCPA2Aserver {
  * Author: Kanshi Tanaike
  * https://github.com/tanaikech/FileSearchApp
  *
- * Updated on 20251113 1048
- * version 1.0.0
+ * Updated on 20260624
+ * version 1.0.1
  */
 
 /**
