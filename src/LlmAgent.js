@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v1.3.4] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
+ * [Production Release v1.3.5] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -51,6 +51,8 @@
  * });
  * agent.setServices({ lock: LockService.getScriptLock() });
  */
+var gasGlobalContext = this;
+
 var LlmAgent = class LlmAgent {
   constructor(config = {}) {
     this.apiKey = config.apiKey;
@@ -90,6 +92,10 @@ var LlmAgent = class LlmAgent {
     this.outputSchema = config.outputSchema || null;
     this.logSpreadsheetId = config.logSpreadsheetId || ""; // Propagated down to MCPApp and A2AApp in v1.3.3
 
+    // Hooks System
+    this.hookManager = new GasHookManager(config.hooks || []);
+    this.sessionId = "session_" + (typeof Utilities !== "undefined" ? Utilities.getUuid() : Math.random().toString(36).substring(2));
+
     // Internal state
     this.history = [];
     this.logs = [];
@@ -98,8 +104,64 @@ var LlmAgent = class LlmAgent {
     this._capabilitiesInitialized = false;
   }
 
+  /**
+   * Helper to execute prompt against model, wrapped with BeforeModel and AfterModel hooks.
+   *
+   * @param {Object} config - Gemini configuration object.
+   * @param {string} query - The prompt query.
+   * @returns {string} The output text.
+   * @private
+   */
+  _generateContent(config, query) {
+    // Construct request metadata to pass to BeforeModel
+    const beforeResult = this.hookManager.execute("BeforeModel", {
+      config,
+      query,
+      history: this.history || [],
+      model: this.model
+    });
+
+    if (beforeResult.decision === "deny") {
+      throw new Error(`Model request blocked by BeforeModel hook.`);
+    }
+
+    const activeConfig = beforeResult.config || config;
+    const activeQuery = beforeResult.query || query;
+
+    let text;
+    // Check if the hook returned a mocked llm_response (allowing API call skip)
+    const mockedResponse = beforeResult.hookSpecificOutput?.llm_response || beforeResult.llm_response;
+    if (mockedResponse && mockedResponse.text !== undefined) {
+      text = mockedResponse.text;
+    } else {
+      text = new GeminiWithFiles(activeConfig).generateContent({ q: activeQuery });
+    }
+
+    // Call AfterModel with request and response details
+    const afterResult = this.hookManager.execute("AfterModel", {
+      config: activeConfig,
+      query: activeQuery,
+      history: this.history || [],
+      model: this.model,
+      text: text
+    });
+
+    if (afterResult.decision === "deny") {
+      throw new Error(`Model response blocked and discarded by AfterModel hook.`);
+    }
+
+    const modifiedResponse = afterResult.hookSpecificOutput?.llm_response || afterResult.llm_response;
+    if (modifiedResponse && modifiedResponse.text !== undefined) {
+      return modifiedResponse.text;
+    }
+    return afterResult.text !== undefined ? afterResult.text : text;
+  }
+
   setServices(services = {}) {
     this.services = services;
+    if (this.services.globalContext && this.hookManager) {
+      this.hookManager.setGlobalContext(this.services.globalContext);
+    }
     this._initializeCapabilities();
     return this;
   }
@@ -198,6 +260,7 @@ var LlmAgent = class LlmAgent {
     const log = (message, data = null) => {
       const entry = { timestamp: new Date().toISOString(), message, data };
       this.logs.push(entry);
+      this.hookManager.execute("Notification", { message, data, toolName: data?.capability_id || "" });
       if (logCallback) logCallback(entry);
     };
 
@@ -463,16 +526,17 @@ var LlmAgent = class LlmAgent {
 
   _executeTask(cap, executionPrompt) {
     if (!cap) {
-      const g = new GeminiWithFiles({
+      const config = {
         apiKey: this.apiKey,
         model: this.model,
         history: [...this.history],
-      });
-      return g.generateContent({ q: executionPrompt });
+      };
+      return this._generateContent(config, executionPrompt);
     }
 
     switch (cap.type) {
       case "Native Tool": {
+        const self = this;
         const funcs = {
           params_: {
             [cap.name]: {
@@ -481,14 +545,59 @@ var LlmAgent = class LlmAgent {
             },
           },
         };
-        funcs[cap.name] = cap._tool.function;
-        const g = new GeminiWithFiles({
+        
+        // Wrap the native function with BeforeTool/AfterTool hook handlers to catch actual arguments
+        funcs[cap.name] = function(args) {
+          // 1. EXECUTE BeforeTool Hook with actual LLM-generated arguments
+          const beforeToolRes = self.hookManager.execute("BeforeTool", {
+            prompt: self.currentPrompt || "",
+            toolName: cap.name,
+            tool_name: cap.name,
+            tool_input: args,
+            capabilityId: cap.id,
+            capability: cap
+          });
+          
+          if (beforeToolRes.decision === "deny" || beforeToolRes.continue === false) {
+            throw new Error(`Execution blocked by BeforeTool hook: ${beforeToolRes.reason || "Denied tool execution"}`);
+          }
+          
+          // Apply modified arguments if hook returned them
+          const activeArgs = beforeToolRes.hookSpecificOutput?.tool_input || beforeToolRes.tool_input || args;
+          
+          // Run the original function
+          let result = cap._tool.function(activeArgs);
+          
+          // 2. EXECUTE AfterTool Hook with execution result
+          const afterToolRes = self.hookManager.execute("AfterTool", {
+            prompt: self.currentPrompt || "",
+            toolName: cap.name,
+            tool_name: cap.name,
+            tool_input: activeArgs,
+            tool_response: { result: result },
+            result: result,
+            capability: cap
+          });
+          
+          if (afterToolRes.decision === "deny" || afterToolRes.continue === false) {
+            return `[Interception Blocked/Redacted] ${afterToolRes.reason || "Tool output was hidden by hook policy."}`;
+          }
+          
+          let finalResult = afterToolRes.result !== undefined ? afterToolRes.result : result;
+          const additionalToolContext = afterToolRes.hookSpecificOutput?.additionalContext || afterToolRes.additionalContext;
+          if (additionalToolContext) {
+            finalResult = finalResult + "\n\n[Hook Context]:\n" + additionalToolContext;
+          }
+          return finalResult;
+        };
+
+        const config = {
           apiKey: this.apiKey,
           model: this.model,
           functions: funcs,
           history: [...this.history],
-        });
-        return g.generateContent({ q: executionPrompt });
+        };
+        return this._generateContent(config, executionPrompt);
       }
       case "MCP Server": {
         const mcpConfig = {};
@@ -536,24 +645,24 @@ var LlmAgent = class LlmAgent {
         }
         return cap._agent.run(executionPrompt);
       case "Agent Skill": {
-        const g = new GeminiWithFiles({
+        const config = {
           apiKey: this.apiKey,
           model: this.model,
           systemInstruction: {
             parts: [{ text: `Strictly apply this skill:\n\n${cap.content}` }],
           },
           history: [...this.history],
-        });
-        return g.generateContent({ q: executionPrompt });
+        };
+        return this._generateContent(config, executionPrompt);
       }
       case "Built-in Tool": {
-        const g = new GeminiWithFiles({
+        const config = {
           apiKey: this.apiKey,
           model: this.model,
           tools: [cap._tool],
           history: [...this.history],
-        });
-        return g.generateContent({ q: executionPrompt });
+        };
+        return this._generateContent(config, executionPrompt);
       }
       default:
         throw new Error(`Unknown capability: ${cap.type}`);
@@ -561,89 +670,155 @@ var LlmAgent = class LlmAgent {
   }
 
   run(prompt, logCallback = null) {
-    this.startTime = Date.now();
+    try {
+      this.startTime = Date.now();
+      this.currentPrompt = prompt;
 
-    const log = (message, data = null) => {
-      const entry = { timestamp: new Date().toISOString(), message, data };
-      this.logs.push(entry);
-      if (typeof logCallback === "function") logCallback(entry);
-    };
+      // Sync sessionId to hookManager
+      if (this.hookManager) {
+        this.hookManager.sessionId = this.sessionId || this.hookManager.sessionId;
+      }
 
-    if (!this._capabilitiesInitialized) this._initializeCapabilities(log);
-    log("Agent run sequence initiated", { prompt });
+      // EXECUTE SessionStart Hook
+      const sessionStartRes = this.hookManager.execute("SessionStart", { prompt, source: "startup" });
+      prompt = sessionStartRes.prompt || prompt;
+      const sessionContext = sessionStartRes.hookSpecificOutput?.additionalContext || sessionStartRes.additionalContext;
+      if (sessionContext) {
+        prompt = prompt + "\n\n[Session Start Context]:\n" + sessionContext;
+      }
 
-    // Global Context Hoisting
-    const temporalContext = `\n[System Time Anchor]: Current system date/time is ${new Date().toString()}. Use this as the baseline for relative time references.`;
+      const log = (message, data = null) => {
+        const entry = { timestamp: new Date().toISOString(), message, data };
+        this.logs.push(entry);
+        
+        const notifyRes = this.hookManager.execute("Notification", { 
+          message, 
+          data, 
+          toolName: data?.capability_id || "",
+          notification_type: "Log",
+          details: data
+        });
+        
+        if (notifyRes.systemMessage && typeof logCallback === "function") {
+          logCallback({ timestamp: new Date().toISOString(), message: `[Hook Notification Message] ${notifyRes.systemMessage}`, data });
+        }
+        if (typeof logCallback === "function") logCallback(entry);
+      };
 
-    let globalInstruction = `You are an autonomous orchestrator agent. Designation: "${this.name}".${temporalContext}\n`;
-    let baseInstruction = this.instruction;
-    if (this.state && typeof baseInstruction === "string") {
-      baseInstruction = baseInstruction.replace(/{(\w+)}/g, (match, key) =>
-        this.state[key] !== undefined ? this.state[key] : match,
-      );
-    }
-    if (baseInstruction)
-      globalInstruction += `User Persona & Core Instructions: ${typeof baseInstruction === "string" ? baseInstruction : JSON.stringify(baseInstruction)}\n`;
+      if (sessionStartRes.systemMessage) {
+        log(`[SessionStart Hook Message] ${sessionStartRes.systemMessage}`);
+      }
 
-    // Capability Compaction
-    const plannerCapabilities = this.capabilities.map((c) => ({
-      id: c.id,
-      type: c.type,
-      name: c.name,
-      description: c.description,
-    }));
-    const capabilityIds = this.capabilities.map((c) => c.id);
+      if (!this._capabilitiesInitialized) this._initializeCapabilities(log);
+      log("Agent run sequence initiated", { prompt });
 
-    // Unified Schema Definitions
-    const taskArraySchema = {
-      type: "array",
-      items: {
+      // EXECUTE PreCompress Hook (Standard lifecycle alignment)
+      const preCompressRes = this.hookManager.execute("PreCompress", { trigger: "auto" });
+      if (preCompressRes.systemMessage) {
+        log(`[PreCompress Hook Message] ${preCompressRes.systemMessage}`);
+      }
+
+      // EXECUTE BeforeAgent Hook
+      const beforeAgentRes = this.hookManager.execute("BeforeAgent", { prompt });
+      if (beforeAgentRes.decision === "deny" || beforeAgentRes.continue === false) {
+        throw new Error(`Execution blocked by BeforeAgent hook: ${beforeAgentRes.reason || "Denied"}`);
+      }
+      
+      const agentContext = beforeAgentRes.hookSpecificOutput?.additionalContext || beforeAgentRes.additionalContext;
+      if (agentContext) {
+        prompt = prompt + "\n\n[Additional Context]:\n" + agentContext;
+      } else if (beforeAgentRes.prompt) {
+        prompt = beforeAgentRes.prompt;
+      }
+
+      // Global Context Hoisting
+      const temporalContext = `\n[System Time Anchor]: Current system date/time is ${new Date().toString()}. Use this as the baseline for relative time references.`;
+
+      let globalInstruction = `You are an autonomous orchestrator agent. Designation: "${this.name}".${temporalContext}\n`;
+      let baseInstruction = this.instruction;
+      if (this.state && typeof baseInstruction === "string") {
+        baseInstruction = baseInstruction.replace(/{(\w+)}/g, (match, key) =>
+          this.state[key] !== undefined ? this.state[key] : match,
+        );
+      }
+      if (baseInstruction)
+        globalInstruction += `User Persona & Core Instructions: ${typeof baseInstruction === "string" ? baseInstruction : JSON.stringify(baseInstruction)}\n`;
+
+      // Capability Compaction
+      const plannerCapabilities = this.capabilities.map((c) => ({
+        id: c.id,
+        type: c.type,
+        name: c.name,
+        description: c.description,
+      }));
+
+      // EXECUTE BeforeToolSelection Hook
+      const beforeToolSelectionRes = this.hookManager.execute("BeforeToolSelection", { capabilities: plannerCapabilities });
+      let activeCapabilities = beforeToolSelectionRes.capabilities || plannerCapabilities;
+      
+      const toolConfig = beforeToolSelectionRes.hookSpecificOutput?.toolConfig || beforeToolSelectionRes.toolConfig;
+      if (toolConfig) {
+        if (toolConfig.mode === "NONE") {
+          activeCapabilities = [];
+        } else if (Array.isArray(toolConfig.allowedFunctionNames)) {
+          activeCapabilities = activeCapabilities.filter(c => 
+            toolConfig.allowedFunctionNames.includes(c.name) || 
+            toolConfig.allowedFunctionNames.includes(c.id)
+          );
+        }
+      }
+      const capabilityIds = activeCapabilities.map((c) => c.id);
+
+      // Unified Schema Definitions
+      const taskArraySchema = {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            task_id: { type: "number" },
+            description: { type: "string" },
+            capability_id: { type: "string", enum: capabilityIds },
+            execution_prompt: { type: "string" },
+            depends_on: {
+              type: "array",
+              items: { type: "number" },
+              description: "Task IDs this task depends on.",
+            },
+          },
+          required: [
+            "task_id",
+            "description",
+            "capability_id",
+            "execution_prompt",
+            "depends_on",
+          ],
+        },
+      };
+
+      const plannerSchema = {
         type: "object",
         properties: {
-          task_id: { type: "number" },
-          description: { type: "string" },
-          capability_id: { type: "string", enum: capabilityIds },
-          execution_prompt: { type: "string" },
-          depends_on: {
-            type: "array",
-            items: { type: "number" },
-            description: "Task IDs this task depends on.",
+          requires_capabilities: {
+            type: "boolean",
+            description: "True ONLY if external tools are strictly required.",
           },
+          direct_answer: {
+            type: "string",
+            description:
+              "If requires_capabilities is false, provide the final comprehensive answer here directly to the user.",
+          },
+          plan: taskArraySchema,
         },
-        required: [
-          "task_id",
-          "description",
-          "capability_id",
-          "execution_prompt",
-          "depends_on",
-        ],
-      },
-    };
+        required: ["requires_capabilities"],
+      };
 
-    const plannerSchema = {
-      type: "object",
-      properties: {
-        requires_capabilities: {
-          type: "boolean",
-          description: "True ONLY if external tools are strictly required.",
-        },
-        direct_answer: {
-          type: "string",
-          description:
-            "If requires_capabilities is false, provide the final comprehensive answer here directly to the user.",
-        },
-        plan: taskArraySchema,
-      },
-      required: ["requires_capabilities"],
-    };
-
-    const plannerPromptStr = `
+      const plannerPromptStr = `
 Objective: Decompose the user's prompt into tasks and assign MINIMAL necessary capabilities.
 
 User Prompt: "${prompt}"
 
 Available Capabilities:
-${JSON.stringify(plannerCapabilities, null, 2)}
+${JSON.stringify(activeCapabilities, null, 2)}
 
 Instructions:
 1. Decompose the prompt into sequential tasks. Select exactly ONE capability per task by its "id".
@@ -654,191 +829,267 @@ Instructions:
 5. BAN ON SYNTHESIS TASKS (CRITICAL): Do NOT create tasks for compiling, summarizing, formatting, or synthesizing the final answer. The system automatically executes a final synthesis phase using all gathered data. Create tasks ONLY for actively executing tools or fetching data.
 `;
 
-    log("Planning phase initiated.");
-    const plannerConfig = {
-      apiKey: this.apiKey,
-      model: this.model,
-      history: this.history,
-      systemInstruction: { parts: [{ text: globalInstruction }] },
-      responseSchema: plannerSchema,
-    };
+      log("Planning phase initiated.");
+      const plannerConfig = {
+        apiKey: this.apiKey,
+        model: this.model,
+        history: this.history,
+        systemInstruction: { parts: [{ text: globalInstruction }] },
+        responseSchema: plannerSchema,
+      };
 
-    let planResultText;
-    try {
-      planResultText = new GeminiWithFiles(plannerConfig).generateContent({
-        q: plannerPromptStr,
-      });
-    } catch (e) {
-      throw new Error(`Initial Planning Phase Error: ${e.message}`);
-    }
+      let planResultText;
+      try {
+        planResultText = this._generateContent(plannerConfig, plannerPromptStr);
+      } catch (e) {
+        throw new Error(`Initial Planning Phase Error: ${e.message}`);
+      }
 
-    let planResult;
-    try {
-      planResult = this._extractJson(planResultText);
-    } catch (e) {
-      throw new Error(
-        `Invalid JSON returned from Planner: ${e.message}\nRaw Output: ${planResultText}`,
-      );
-    }
-
-    let planQueue = [];
-    let taskResults = [];
-    let replanCount = 0;
-
-    // ==========================================
-    // ZERO-SYNTHESIS BYPASS & SCHEMA INTERCEPTION
-    // ==========================================
-    if (planResult.requires_capabilities === false) {
-      const directAns =
-        planResult.direct_answer || "No capabilities required to answer.";
-
-      // Intercept bypass if outputSchema is demanded to ensure strict formatting
-      if (this.outputSchema) {
-        log(
-          "One-Pass Fast-Track intercepted: 'outputSchema' is defined. Routing to Synthesis for strict formatting.",
+      let planResult;
+      try {
+        planResult = this._extractJson(planResultText);
+      } catch (e) {
+        throw new Error(
+          `Invalid JSON returned from Planner: ${e.message}\nRaw Output: ${planResultText}`,
         );
-        taskResults.push({
-          task_id: 0,
-          capability_used: "None",
-          capability_type: "None",
-          prompt: prompt,
-          result: directAns,
-          duration_ms: 0,
-        });
-        // planQueue remains empty, dropping immediately into the final Synthesis loop
+      }
+
+      let planQueue = [];
+      let taskResults = [];
+      let replanCount = 0;
+
+      // ==========================================
+      // ZERO-SYNTHESIS BYPASS & SCHEMA INTERCEPTION
+      // ==========================================
+      if (planResult.requires_capabilities === false) {
+        const directAns =
+          planResult.direct_answer || "No capabilities required to answer.";
+
+        // Intercept bypass if outputSchema is demanded to ensure strict formatting
+        if (this.outputSchema) {
+          log(
+            "One-Pass Fast-Track intercepted: 'outputSchema' is defined. Routing to Synthesis for strict formatting.",
+          );
+          taskResults.push({
+            task_id: 0,
+            capability_used: "None",
+            capability_type: "None",
+            prompt: prompt,
+            result: directAns,
+            duration_ms: 0,
+          });
+          // planQueue remains empty, dropping immediately into the final Synthesis loop
+        } else {
+          log(
+            "One-Pass Fast-Track Triggered: Bypassing execution and synthesis entirely.",
+          );
+          
+          let agentResult = directAns;
+
+          // EXECUTE AfterAgent Hook
+          const afterAgentRes = this.hookManager.execute("AfterAgent", {
+            finalAnswer: agentResult,
+            prompt_response: agentResult,
+            prompt: prompt,
+            stop_hook_active: false
+          });
+          
+          let forceRetry = (afterAgentRes.decision === "deny" || afterAgentRes.continue === false || afterAgentRes.retry === true);
+          let retryPrompt = afterAgentRes.reason || afterAgentRes.retryPrompt || prompt;
+          agentResult = afterAgentRes.prompt_response || afterAgentRes.finalAnswer || agentResult;
+
+          if (afterAgentRes.clearContext === true) {
+            log("AfterAgent hook requested clearContext: clearing history.");
+            this.history = [];
+          }
+
+          this.history.push({ role: "user", parts: [{ text: prompt }] });
+          this.history.push({ role: "model", parts: [{ text: agentResult }] });
+
+          // EXECUTE SessionEnd Hook
+          const sessionEndRes = this.hookManager.execute("SessionEnd", { 
+            finalAnswer: agentResult, 
+            error: null, 
+            prompt: prompt,
+            reason: "exit"
+          });
+          if (sessionEndRes.systemMessage) {
+            log(`[SessionEnd Hook Message] ${sessionEndRes.systemMessage}`);
+          }
+
+          if (forceRetry && (!this._retryCount || this._retryCount < 2)) {
+            this._retryCount = (this._retryCount || 0) + 1;
+            log(`AfterAgent hook requested retry (decision: deny/retry). Initiating retry ${this._retryCount} with prompt/reason: ${retryPrompt}`);
+            const retryResult = this.run(retryPrompt, logCallback);
+            this._retryCount = 0; // reset
+            return retryResult;
+          }
+
+          return agentResult;
+        }
       } else {
-        log(
-          "One-Pass Fast-Track Triggered: Bypassing execution and synthesis entirely.",
-        );
-        this.history.push({ role: "user", parts: [{ text: prompt }] });
-        this.history.push({ role: "model", parts: [{ text: directAns }] });
-        return directAns;
-      }
-    } else {
-      planQueue = planResult.plan || [];
-      const planSummary = planQueue
-        .map((t) => `Task [${t.task_id}]: '${t.capability_id}'`)
-        .join("\n");
-      log("Execution Plan Generated:\n" + planSummary, { plan: planQueue });
-    }
-
-    let highestTaskId = Math.max(...planQueue.map((t) => t.task_id), 0);
-
-    // ==========================================
-    // ADAPTIVE EXECUTION PHASE
-    // ==========================================
-    while (planQueue.length > 0) {
-      const timeElapsed = Date.now() - this.startTime;
-      if (timeElapsed > this.timeoutMs) {
-        log(
-          `[TIMEOUT PREVENTION] Safe abort triggered. Elapsed: ${timeElapsed}ms exceeds ${this.timeoutMs}ms limit.`,
-        );
-        break;
+        planQueue = planResult.plan || [];
+        const planSummary = planQueue
+          .map((t) => `Task [${t.task_id}]: '${t.capability_id}'`)
+          .join("\n");
+        log("Execution Plan Generated:\n" + planSummary, { plan: planQueue });
       }
 
-      const task = planQueue.shift();
-      log(`Executing Task [${task.task_id}] via [${task.capability_id}]`, {
-        description: task.description,
-      });
+      let highestTaskId = Math.max(...planQueue.map((t) => t.task_id), 0);
 
-      const cap = this.capabilities.find((c) => c.id === task.capability_id);
-
-      let contextStr = "";
-      if (task.depends_on && task.depends_on.length > 0) {
-        const dependentResults = taskResults.filter(
-          (tr) => task.depends_on.includes(tr.task_id) && !tr.error,
-        );
-        if (dependentResults.length > 0)
-          contextStr = `\n\n[Context from dependent tasks]:\n${JSON.stringify(dependentResults)}`;
-      }
-
-      const finalExecutionPrompt = task.execution_prompt + contextStr;
-
-      let rawResultData;
-      let taskError = null;
-      let retries = 1;
-      const taskStartTime = Date.now();
-
-      while (retries >= 0) {
-        try {
-          rawResultData = this._executeTask(cap, finalExecutionPrompt);
-          taskError = null;
+      // ==========================================
+      // ADAPTIVE EXECUTION PHASE
+      // ==========================================
+      while (planQueue.length > 0) {
+        const timeElapsed = Date.now() - this.startTime;
+        if (timeElapsed > this.timeoutMs) {
+          log(
+            `[TIMEOUT PREVENTION] Safe abort triggered. Elapsed: ${timeElapsed}ms exceeds ${this.timeoutMs}ms limit.`,
+          );
           break;
-        } catch (err) {
-          if (retries === 0) {
-            taskError = err.message;
-          } else {
-            log(`Task [${task.task_id}] failed, retrying...`, {
-              error: err.message,
-            });
-            Utilities.sleep(2000);
-            retries--;
+        }
+
+        const task = planQueue.shift();
+        log(`Executing Task [${task.task_id}] via [${task.capability_id}]`, {
+          description: task.description,
+        });
+
+        const cap = this.capabilities.find((c) => c.id === task.capability_id);
+
+        let contextStr = "";
+        if (task.depends_on && task.depends_on.length > 0) {
+          const dependentResults = taskResults.filter(
+            (tr) => task.depends_on.includes(tr.task_id) && !tr.error,
+          );
+          if (dependentResults.length > 0)
+            contextStr = `\n\n[Context from dependent tasks]:\n${JSON.stringify(dependentResults)}`;
+        }
+
+        const finalExecutionPrompt = task.execution_prompt + contextStr;
+
+        let rawResultData;
+        let taskError = null;
+        let retries = 1;
+        const taskStartTime = Date.now();
+
+        // EXECUTE BeforeTool Hook (Skip for Native Tools to avoid early verification with missing args)
+        const isNativeTool = cap && cap.type === "Native Tool";
+        const beforeToolRes = isNativeTool ? { decision: "allow" } : this.hookManager.execute("BeforeTool", {
+          prompt: prompt,
+          toolName: cap ? cap.name : task.capability_id,
+          capabilityId: task.capability_id,
+          executionPrompt: finalExecutionPrompt,
+          task: task,
+          capability: cap
+        });
+
+        if (beforeToolRes.decision === "deny") {
+          taskError = `Execution blocked by BeforeTool hook: ${beforeToolRes.reason || "Denied tool execution"}`;
+          retries = -1; // Prevent retry loop
+        } else {
+          const activeExecutionPrompt = beforeToolRes.executionPrompt || finalExecutionPrompt;
+
+          while (retries >= 0) {
+            try {
+              rawResultData = this._executeTask(cap, activeExecutionPrompt);
+              taskError = null;
+              break;
+            } catch (err) {
+              if (retries === 0) {
+                taskError = err.message;
+              } else {
+                log(`Task [${task.task_id}] failed, retrying...`, {
+                  error: err.message,
+                });
+                Utilities.sleep(2000);
+                retries--;
+              }
+            }
           }
         }
-      }
 
-      const durationMs = Date.now() - taskStartTime;
+        const durationMs = Date.now() - taskStartTime;
 
-      // Result Payload Truncation (Bulletproofing against 400 Payload Too Large)
-      let finalResultData = null;
-      if (!taskError) {
-        let resultStr =
-          typeof rawResultData === "object"
-            ? JSON.stringify(rawResultData)
-            : String(rawResultData);
-        if (resultStr.length > this.maxResultLength) {
-          log(
-            `[PAYLOAD WARNING] Task [${task.task_id}] result length (${resultStr.length}) exceeded limit. Truncating to ${this.maxResultLength} chars.`,
-          );
-          resultStr =
-            resultStr.substring(0, this.maxResultLength) +
-            "\n\n...[TRUNCATED: Exceeds context limit]";
+        // Result Payload Truncation (Bulletproofing against 400 Payload Too Large)
+        let finalResultData = null;
+        if (!taskError) {
+          let resultStr =
+            typeof rawResultData === "object"
+              ? JSON.stringify(rawResultData)
+              : String(rawResultData);
+          if (resultStr.length > this.maxResultLength) {
+            log(
+              `[PAYLOAD WARNING] Task [${task.task_id}] result length (${resultStr.length}) exceeded limit. Truncating to ${this.maxResultLength} chars.`,
+            );
+            resultStr =
+              resultStr.substring(0, this.maxResultLength) +
+              "\n\n...[TRUNCATED: Exceeds context limit]";
+          }
+          finalResultData = resultStr;
+
+          // EXECUTE AfterTool Hook (Skip for Native Tools to avoid double-firing)
+          const afterToolRes = isNativeTool ? { result: finalResultData } : this.hookManager.execute("AfterTool", {
+            prompt: prompt,
+            toolName: cap ? cap.name : task.capability_id,
+            capabilityId: task.capability_id,
+            result: finalResultData,
+            task: task,
+            capability: cap
+          });
+          
+          if (afterToolRes.decision === "deny" || afterToolRes.continue === false) {
+            finalResultData = `[Interception Blocked/Redacted] ${afterToolRes.reason || "Tool output was hidden by hook policy."}`;
+          } else {
+            finalResultData = afterToolRes.result !== undefined ? afterToolRes.result : finalResultData;
+            const additionalToolContext = afterToolRes.hookSpecificOutput?.additionalContext || afterToolRes.additionalContext;
+            if (additionalToolContext) {
+              finalResultData = finalResultData + "\n\n[Hook Context]:\n" + additionalToolContext;
+            }
+          }
         }
-        finalResultData = resultStr;
-      }
 
-      if (!taskError) {
-        taskResults.push({
-          task_id: task.task_id,
-          capability_used: task.capability_id,
-          capability_type: cap ? cap.type : "Unknown",
-          prompt: task.execution_prompt,
-          result: finalResultData,
-          duration_ms: durationMs,
-        });
-        log(
-          `Task [${task.task_id}] completed successfully in ${durationMs}ms.`,
-        );
-      } else {
-        taskResults.push({
-          task_id: task.task_id,
-          capability_used: task.capability_id,
-          capability_type: cap ? cap.type : "Unknown",
-          prompt: task.execution_prompt,
-          error: taskError,
-          duration_ms: durationMs,
-        });
-        log(`Task [${task.task_id}] failed definitively in ${durationMs}ms.`, {
-          error: taskError,
-        });
-
-        // Dynamic Re-Planning Trigger
-        if (replanCount < this.maxReplans) {
-          replanCount++;
+        if (!taskError) {
+          taskResults.push({
+            task_id: task.task_id,
+            capability_used: task.capability_id,
+            capability_type: cap ? cap.type : "Unknown",
+            prompt: task.execution_prompt,
+            result: finalResultData,
+            duration_ms: durationMs,
+          });
           log(
-            `[DYNAMIC RE-PLANNING] Attempt ${replanCount}/${this.maxReplans}. Discarding remaining queue and regenerating DAG...`,
+            `Task [${task.task_id}] completed successfully in ${durationMs}ms.`,
           );
-          planQueue.length = 0;
+        } else {
+          taskResults.push({
+            task_id: task.task_id,
+            capability_used: task.capability_id,
+            capability_type: cap ? cap.type : "Unknown",
+            prompt: task.execution_prompt,
+            error: taskError,
+            duration_ms: durationMs,
+          });
+          log(`Task [${task.task_id}] failed definitively in ${durationMs}ms.`, {
+            error: taskError,
+          });
 
-          const replanPromptStr = `
+          // Dynamic Re-Planning Trigger
+          if (replanCount < this.maxReplans) {
+            replanCount++;
+            log(
+              `[DYNAMIC RE-PLANNING] Attempt ${replanCount}/${this.maxReplans}. Discarding remaining queue and regenerating DAG...`,
+            );
+            planQueue.length = 0;
+
+            const replanPromptStr = `
 [SYSTEM PRIORITY OVERRIDE] Re-plan remaining steps due to failure.
 Original Prompt: "${prompt}"
-Capabilities: ${JSON.stringify(plannerCapabilities, null, 2)}
+Capabilities: ${JSON.stringify(activeCapabilities, null, 2)}
 Successful Tasks: ${JSON.stringify(
-            taskResults.filter((t) => !t.error),
-            null,
-            2,
-          )}
+              taskResults.filter((t) => !t.error),
+              null,
+              2,
+            )}
 
 FAILURE REPORT:
 Failed Capability: ${task.capability_id}
@@ -848,44 +1099,45 @@ Instructions:
 1. Bypass the error. Do NOT use the exact same capability/prompt combination.
 2. Decompose remaining work into sequential tasks strictly starting from task_id: ${highestTaskId + 1}.
 `;
-          try {
-            // Re-planner explicitly uses the Array Schema
-            const replanResText = new GeminiWithFiles({
-              ...plannerConfig,
-              responseSchema: taskArraySchema,
-            }).generateContent({ q: replanPromptStr });
-            const newPlan = this._extractJson(replanResText);
-            planQueue.push(...newPlan);
-            highestTaskId = Math.max(
-              highestTaskId,
-              ...newPlan.map((t) => t.task_id),
+            try {
+              // Re-planner explicitly uses the Array Schema
+              const replanConfig = {
+                ...plannerConfig,
+                responseSchema: taskArraySchema,
+              };
+              const replanResText = this._generateContent(replanConfig, replanPromptStr);
+              const newPlan = this._extractJson(replanResText);
+              planQueue.push(...newPlan);
+              highestTaskId = Math.max(
+                highestTaskId,
+                ...newPlan.map((t) => t.task_id),
+              );
+              log("Re-planning successful. Appended new tasks to queue.", {
+                newPlan,
+              });
+            } catch (replanErr) {
+              log("Re-planning failed. Forcing synthesis.", {
+                error: replanErr.message,
+              });
+              break;
+            }
+          } else {
+            log(
+              "Maximum re-planning limits reached. Continuing with failure state.",
             );
-            log("Re-planning successful. Appended new tasks to queue.", {
-              newPlan,
-            });
-          } catch (replanErr) {
-            log("Re-planning failed. Forcing synthesis.", {
-              error: replanErr.message,
-            });
-            break;
           }
-        } else {
-          log(
-            "Maximum re-planning limits reached. Continuing with failure state.",
-          );
         }
       }
-    }
 
-    log("Execution phase complete. Initiating final synthesis.");
+      log("Execution phase complete. Initiating final synthesis.");
 
-    let timeWarning = "";
-    if (Date.now() - this.startTime > this.timeoutMs) {
-      timeWarning =
-        "\n[CRITICAL SYSTEM WARNING]: Execution was preemptively interrupted to prevent a system timeout. Answer based ONLY on the partial results gathered so far.";
-    }
+      let timeWarning = "";
+      if (Date.now() - this.startTime > this.timeoutMs) {
+        timeWarning =
+          "\n[CRITICAL SYSTEM WARNING]: Execution was preemptively interrupted to prevent a system timeout. Answer based ONLY on the partial results gathered so far.";
+      }
 
-    const synthesizePrompt = `
+      const synthesizePrompt = `
 [SYSTEM: FINAL SYNTHESIS]
 Original User Prompt: "${prompt}"
 
@@ -899,34 +1151,88 @@ Objective:
 3. CRITICAL: Append an "Execution Summary" at the very end of your response detailing the capabilities used, execution order, duration (ms), and prompts. If no capabilities were used, explicitly state "NO capabilities were used".
 `;
 
-    const synthConfig = {
-      apiKey: this.apiKey,
-      model: this.model,
-      history: this.history,
-      systemInstruction: { parts: [{ text: globalInstruction }] },
-    };
-    if (this.outputSchema) synthConfig.responseSchema = this.outputSchema;
-    if (this.generateContentConfig)
-      synthConfig.generationConfig = this.generateContentConfig;
+      const synthConfig = {
+        apiKey: this.apiKey,
+        model: this.model,
+        history: this.history,
+        systemInstruction: { parts: [{ text: globalInstruction }] },
+      };
+      if (this.outputSchema) synthConfig.responseSchema = this.outputSchema;
+      if (this.generateContentConfig)
+        synthConfig.generationConfig = this.generateContentConfig;
 
-    const finalAnswer = new GeminiWithFiles(synthConfig).generateContent({
-      q: synthesizePrompt,
-    });
+      const finalAnswer = this._generateContent(synthConfig, synthesizePrompt);
 
-    log("Final synthesis complete.");
-    this.history.push({ role: "user", parts: [{ text: prompt }] });
-    this.history.push({
-      role: "model",
-      parts: [
-        {
-          text:
-            typeof finalAnswer === "string"
-              ? finalAnswer
-              : JSON.stringify(finalAnswer),
-        },
-      ],
-    });
+      log("Final synthesis complete.");
 
-    return finalAnswer;
+      let agentResult = finalAnswer;
+
+      // EXECUTE AfterAgent Hook
+      const afterAgentRes = this.hookManager.execute("AfterAgent", {
+        finalAnswer: agentResult,
+        prompt_response: agentResult,
+        prompt: prompt,
+        stop_hook_active: false
+      });
+      
+      let forceRetry = (afterAgentRes.decision === "deny" || afterAgentRes.continue === false || afterAgentRes.retry === true);
+      let retryPrompt = afterAgentRes.reason || afterAgentRes.retryPrompt || prompt;
+      agentResult = afterAgentRes.prompt_response || afterAgentRes.finalAnswer || agentResult;
+
+      if (afterAgentRes.clearContext === true) {
+        log("AfterAgent hook requested clearContext: clearing history.");
+        this.history = [];
+      }
+
+      this.history.push({ role: "user", parts: [{ text: prompt }] });
+      this.history.push({
+        role: "model",
+        parts: [
+          {
+            text:
+              typeof agentResult === "string"
+                ? agentResult
+                : JSON.stringify(agentResult),
+          },
+        ],
+      });
+
+      // EXECUTE SessionEnd Hook
+      const sessionEndRes = this.hookManager.execute("SessionEnd", { 
+        finalAnswer: agentResult, 
+        error: null, 
+        prompt: prompt,
+        reason: "exit"
+      });
+      if (sessionEndRes.systemMessage) {
+        log(`[SessionEnd Hook Message] ${sessionEndRes.systemMessage}`);
+      }
+
+      if (forceRetry && (!this._retryCount || this._retryCount < 2)) {
+        this._retryCount = (this._retryCount || 0) + 1;
+        log(`AfterAgent hook requested retry (decision: deny/retry). Initiating retry ${this._retryCount} with prompt/reason: ${retryPrompt}`);
+        const retryResult = this.run(retryPrompt, logCallback);
+        this._retryCount = 0; // reset
+        return retryResult;
+      }
+
+      return agentResult;
+    } catch (err) {
+      // EXECUTE SessionEnd Hook on error
+      try {
+        const sessionEndRes = this.hookManager.execute("SessionEnd", { 
+          finalAnswer: null, 
+          error: err.message, 
+          prompt: prompt,
+          reason: "error"
+        });
+        if (sessionEndRes.systemMessage) {
+          console.log(`[SessionEnd Hook Message on Error] ${sessionEndRes.systemMessage}`);
+        }
+      } catch (endErr) {
+        console.error(`[HookManager Error] Failed executing SessionEnd hook on error: ${endErr.message}`);
+      }
+      throw err;
+    }
   }
 };

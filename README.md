@@ -699,6 +699,115 @@ For the full implementation script and a beginner-friendly setup guide, see:
 
 [MIT](https://tanaikech.github.io/license/)
 
+## 🛡 Hooks System & Workspace Safety Guardrails (v1.3.5+)
+
+GASADK introduces a comprehensive Hooks system fully compliant with the Gemini CLI specifications. Developers can intercept the execution lifecycle of the agent, apply validations, inject context, mock responses, or enforce safety guardrails.
+
+### Lifecycle Hook Events
+The system supports the following lifecycle events:
+* **SessionStart**: Triggered at session initiation (useful for context load or initialization).
+* **SessionEnd**: Triggered at session termination (exit or error).
+* **BeforeAgent**: Fired after user input but before planning. Can block execution or inject prompt context.
+* **AfterAgent**: Fired after the final synthesis. Can trigger context clearing or execute conditional retries.
+* **BeforeModel**: Fired before LLM request transmission. Allows config override or returning mock responses.
+* **AfterModel**: Fired upon receiving LLM response. Allows response rewriting or blocking.
+* **BeforeToolSelection**: Fired before capability selection. Allows toolMode and function white-listing.
+* **BeforeTool**: Fired before a tool is executed. Blocks execution or overrides arguments.
+* **AfterTool**: Fired after tool execution. Allows result editing, masking, or error handling.
+* **PreCompress**: Fired before history context compaction occurs.
+* **Notification**: Fired when system logs or alerts occur.
+
+---
+
+### Workspace Safety Guardrails Example
+Below is a practical implementation of **BeforeTool** hooks to construct safety guardrails. It prevents an autonomous agent from executing dangerous operations (e.g., sending emails to external addresses or deleting critical folders) by validating model-generated arguments at the tool execution boundary.
+
+#### 1. Defining the Guardrail Hook
+This GAS function intercepts Gmail transmission and Drive folder deletion:
+
+```javascript
+function checkWorkspaceSafetyGuardrail(input) {
+  const toolInput = input.tool_input || {};
+  
+  // Gmail Safety Check: Block external domains
+  if (input.tool_name === "gmail_send_email") {
+    const toAddress = toolInput.to || "";
+    if (!toAddress || !toAddress.endsWith("@mycompany.com")) {
+      return {
+        decision: "deny",
+        reason: "Blocked: Sending mail to external domains (" + toAddress + ") is restricted."
+      };
+    }
+  }
+  
+  // Google Drive Safety Check: Prevent critical asset deletion
+  if (input.tool_name === "drive_delete_file") {
+    const fileId = toolInput.fileId || "";
+    if (fileId === "protected_root_id") {
+      return {
+        decision: "deny",
+        reason: "Blocked: Deletion of the protected root resource is strictly prohibited."
+      };
+    }
+  }
+  
+  return { decision: "allow" };
+}
+```
+
+#### 2. Registering Hooks in the Agent Config
+Instantiate the `LlmAgent` with the safety hook registered under the `BeforeTool` event:
+
+```javascript
+const agent = new LlmAgent({
+  apiKey: API_KEY,
+  name: "SecureWorkspaceAgent",
+  hooks: {
+    "BeforeTool": [
+      {
+        "matcher": "gmail_send_email|drive_delete_file", // RegExp tool matching
+        "type": "gas_function",
+        "functionName": "checkWorkspaceSafetyGuardrail"
+      }
+    ]
+  },
+  tools: [
+    {
+      name: "gmail_send_email",
+      description: "Send emails to targets. Argument 'to' must contain the email address.",
+      parameters: {
+        type: "object",
+        properties: { to: { type: "string" }, body: { type: "string" } },
+        required: ["to", "body"]
+      },
+      function: (args) => {
+        // Actual Gmail transmission code
+        return "Email sent successfully to " + args.to;
+      }
+    },
+    {
+      name: "drive_delete_file",
+      description: "Delete files or folders. Argument 'fileId' must contain the ID.",
+      parameters: {
+        type: "object",
+        properties: { fileId: { type: "string" } },
+        required: ["fileId"]
+      },
+      function: (args) => {
+        // Actual Drive deletion code
+        return "File " + args.fileId + " deleted successfully.";
+      }
+    }
+  ]
+}).setServices({
+  lock: LockService.getScriptLock(),
+  properties: PropertiesService.getScriptProperties(),
+  globalContext: this // Exposes the global checkWorkspaceSafetyGuardrail function
+});
+```
+
+When the agent runs, any attempt to call `gmail_send_email` with an external domain, or `drive_delete_file` with the protected ID will be immediately intercepted and blocked.
+
 ## Author
 
 [Tanaike](https://tanaikech.github.io/about/)
@@ -747,5 +856,12 @@ For the full implementation script and a beginner-friendly setup guide, see:
   - Resolved ReferenceError during global script compilation in Google Apps Script.
   - Removed unbound variables `accessKey` and `webAppsUrl` from the global namespace in `agentCard_ToolsForMCPServer.js`.
   - Implemented runtime shadow cloning in `MCPA2Aserver.js` to dynamically inject the resolved Web App URL context at execution time, ensuring context safety.
+
+- v1.3.5 (June 24, 2026)
+  - Fully integrated Gemini CLI compliant Hooks system.
+  - Added support for all 11 lifecycle hook events (including `PreCompress` and `Notification`).
+  - Added automatic injection of session metadata (`session_id`, `transcript_path`, `cwd`, `hook_event_name`, `timestamp`) into hook payloads.
+  - Implemented Native Tool execution wrappers to enable BeforeTool/AfterTool hooks on model-generated arguments, realizing strict security guardrails.
+  - Enhanced RegExp matcher logic in GasHookManager to properly parse pipe-delimited and wildcard capabilities.
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)

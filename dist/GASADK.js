@@ -1,6 +1,473 @@
+var gasGlobalContext = this;
+
+/**
+ * GasHookManager.js
+ * [Production Release v1.4.3]
+ *
+ * @description
+ * A robust, extensible Hooks System engine for GASADK to register, match, execute,
+ * and merge lifecycle hooks under Google Apps Script constraints.
+ * Resolves functions in the injected global context, local script scope, and globalThis.
+ * All logs, error messages, and comments are written in English.
+ */
+var GasHookManager = class GasHookManager {
+  /**
+   * @param {Object|Array} hooksConfig - The hooks configuration.
+   */
+  constructor(hooksConfig = {}) {
+    this.hooks = [];
+    this.globalContext = null;
+    // Generate a unique session ID for the hook context
+    this.sessionId = "session_" + (typeof Utilities !== "undefined" ? Utilities.getUuid() : Math.random().toString(36).substring(2));
+    this._parseHooksConfig(hooksConfig);
+  }
+
+  /**
+   * Sets the user's runtime global context scope (to resolve hooks defined in the caller project).
+   *
+   * @param {Object} context - The runtime global scope (usually 'this' from the calling script).
+   */
+  setGlobalContext(context) {
+    this.globalContext = context;
+  }
+
+  /**
+   * Parses the hooks configuration object/array into an internalized flat array of hooks.
+   * Supports both nested format (Format A) and flat format (Format B).
+   *
+   * @param {Object|Array} hooksConfig - The hooks configuration.
+   * @private
+   */
+  _parseHooksConfig(hooksConfig) {
+    if (!hooksConfig) return;
+
+    if (Array.isArray(hooksConfig)) {
+      this.hooks = hooksConfig;
+      return;
+    }
+
+    if (typeof hooksConfig === 'object') {
+      for (const event in hooksConfig) {
+        if (!Object.prototype.hasOwnProperty.call(hooksConfig, event)) continue;
+        const items = hooksConfig[event];
+        if (!Array.isArray(items)) continue;
+
+        for (const item of items) {
+          // Format A: Nested hooks array
+          if (item && Array.isArray(item.hooks)) {
+            for (const nestedHook of item.hooks) {
+              this.hooks.push({
+                name: nestedHook.name || `${event}_hook`,
+                description: nestedHook.description || item.description || "",
+                event: event,
+                type: nestedHook.type,
+                functionName: nestedHook.functionName,
+                url: nestedHook.url,
+                command: nestedHook.command,
+                matcher: item.matcher || nestedHook.matcher || "*",
+                timeout: nestedHook.timeout || item.timeout || 10000,
+                sequential: nestedHook.sequential !== undefined ? nestedHook.sequential : (item.sequential || false)
+              });
+            }
+          } else if (item && typeof item === 'object') {
+            // Format B: Flat hook object directly inside the event array
+            this.hooks.push({
+              name: item.name || `${event}_hook`,
+              description: item.description || "",
+              event: event,
+              type: item.type,
+              functionName: item.functionName,
+              url: item.url,
+              command: item.command,
+              matcher: item.matcher || "*",
+              timeout: item.timeout || 10000,
+              sequential: item.sequential || false
+            });
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Dynamically resolves a global function by string name (supporting dot notation)
+   * across multiple scoped contexts.
+   *
+   * @param {string} functionName - Name of the global function (e.g. "myHook" or "MyNamespace.myHook").
+   * @returns {Function|null} The resolved function, or null if not found.
+   * @private
+   */
+  _resolveGlobalFunction(functionName) {
+    if (!functionName) return null;
+
+    // 1. Search in user-injected runtime globalContext
+    if (this.globalContext) {
+      const func = this._resolveInScope(this.globalContext, functionName);
+      if (func) return func;
+    }
+
+    // 2. Fall back to script-level top-level context (captured at initialization)
+    if (typeof gasGlobalContext !== 'undefined' && gasGlobalContext) {
+      const func = this._resolveInScope(gasGlobalContext, functionName);
+      if (func) return func;
+    }
+
+    // 3. Fall back to globalThis
+    return this._resolveInScope(globalThis, functionName);
+  }
+
+  /**
+   * Helper to resolve a dotted path string function within a specific scope object.
+   *
+   * @param {Object} scope - The parent scope object.
+   * @param {string} path - Dotted path string.
+   * @returns {Function|null} Resolved function or null.
+   * @private
+   */
+  _resolveInScope(scope, path) {
+    if (!scope) return null;
+    const parts = path.split('.');
+    let current = scope;
+    for (const part of parts) {
+      if (current[part] === undefined) {
+        return null;
+      }
+      current = current[part];
+    }
+    return typeof current === 'function' ? current : null;
+  }
+
+  /**
+   * Performs wildcard or RegExp matching against tool/capability names.
+   * Supports regex expressions and wildcard symbols as defined in Gemini CLI hooks specs.
+   *
+   * @param {string|RegExp} matcher - RegExp or wildcard string pattern.
+   * @param {string} toolName - The tool or capability name to match.
+   * @returns {boolean} True if matched, false otherwise.
+   * @private
+   */
+  _isMatch(matcher, toolName) {
+    if (!matcher) return true;
+    if (matcher === "*") return true;
+    if (matcher instanceof RegExp) {
+      return matcher.test(toolName);
+    }
+    if (typeof matcher === "string") {
+      // Check if it's a regex literal string representation e.g. "/^tool_/i"
+      if (matcher.startsWith("/") && matcher.lastIndexOf("/") > 0) {
+        const lastSlashIdx = matcher.lastIndexOf("/");
+        const pattern = matcher.substring(1, lastSlashIdx);
+        const flags = matcher.substring(lastSlashIdx + 1);
+        try {
+          const regex = new RegExp(pattern, flags);
+          return regex.test(toolName);
+        } catch (e) {
+          // Fall back
+        }
+      }
+      // Gemini CLI BeforeTool/AfterTool matcher allows regex strings (like "write_.*" or "write_file|replace")
+      // If the string contains regex metacharacters, compile as a RegExp
+      try {
+        let pattern = matcher;
+        // Map wildcard "*" to ".*" if it is just a simple wildcard string, e.g., "write_*"
+        if (pattern.includes("*") && !pattern.includes(".*")) {
+          pattern = pattern.replace(/\*/g, ".*");
+        }
+        // Build regex to support piping (e.g. "write_file|replace") and other regex structures
+        const regex = new RegExp("^(" + pattern + ")$", "i");
+        return regex.test(toolName);
+      } catch (e) {
+        // Fall back to direct case-insensitive match
+      }
+      return matcher.toLowerCase() === toolName.toLowerCase();
+    }
+    return false;
+  }
+
+  /**
+   * Executes a single hook configuration with the provided input payload.
+   *
+   * @param {Object} hook - The hook configuration object.
+   * @param {Object} input - The input payload for the hook.
+   * @returns {Object} The result returned by the hook function or webhook fetch.
+   * @private
+   */
+  _executeSingleHook(hook, input) {
+    if (hook.type === 'gas_function') {
+      const func = this._resolveGlobalFunction(hook.functionName);
+      if (!func) {
+        throw new Error(`CRITICAL: Global function '${hook.functionName}' for hook '${hook.name}' was not found in the global scope.`);
+      }
+      return func(input);
+    } else if (hook.type === 'webhook') {
+      const fetchOptions = {
+        method: "post",
+        contentType: "application/json",
+        payload: JSON.stringify(input),
+        muteHttpExceptions: true
+      };
+      
+      const response = UrlFetchApp.fetch(hook.url, fetchOptions);
+      const code = response.getResponseCode();
+      if (code < 200 || code >= 300) {
+        throw new Error(`CRITICAL: Webhook '${hook.name}' failed with HTTP Status ${code}: ${response.getContentText()}`);
+      }
+      try {
+        return JSON.parse(response.getContentText());
+      } catch (e) {
+        throw new Error(`CRITICAL: Webhook '${hook.name}' returned invalid JSON: ${response.getContentText()}`);
+      }
+    } else if (hook.type === 'command') {
+      console.log(`[Command Hook executed] Bypassing command execution ('${hook.command}') in Google Apps Script. Input event: ${input.event}`);
+      return { decision: "allow" };
+    } else {
+      throw new Error(`CRITICAL: Unsupported hook type '${hook.type}' for hook '${hook.name}'.`);
+    }
+  }
+
+  /**
+   * Merges fields from a hook result back into the current input for sequential chaining.
+   * Support both Gemini CLI hookSpecificOutput namespaces and top-level fields.
+   *
+   * @param {Object} currentInput - The existing input state.
+   * @param {Object} hookResult - The result returned from the hook execution.
+   * @returns {Object} The updated input state.
+   * @private
+   */
+  _mergeSequentialInput(currentInput, hookResult) {
+    if (!hookResult || typeof hookResult !== 'object') {
+      return currentInput;
+    }
+    const updated = { ...currentInput };
+
+    // 1. Unwrap hookSpecificOutput (Gemini CLI namespace structure)
+    if (hookResult.hookSpecificOutput && typeof hookResult.hookSpecificOutput === 'object') {
+      const hso = hookResult.hookSpecificOutput;
+      
+      // BeforeTool.hookSpecificOutput.tool_input
+      if (hso.tool_input !== undefined) {
+        updated.tool_input = hso.tool_input;
+        if (typeof hso.tool_input === 'object' && hso.tool_input.execution_prompt !== undefined) {
+          updated.executionPrompt = hso.tool_input.execution_prompt;
+        } else if (typeof hso.tool_input === 'string') {
+          updated.executionPrompt = hso.tool_input;
+        }
+      }
+
+      // BeforeModel.hookSpecificOutput.llm_request
+      if (hso.llm_request !== undefined) {
+        updated.llm_request = hso.llm_request;
+        if (hso.llm_request.config !== undefined) updated.config = hso.llm_request.config;
+        if (hso.llm_request.prompt !== undefined) updated.query = hso.llm_request.prompt;
+      }
+
+      // BeforeModel / AfterModel.hookSpecificOutput.llm_response
+      if (hso.llm_response !== undefined) {
+        updated.llm_response = hso.llm_response;
+        if (hso.llm_response.text !== undefined) updated.text = hso.llm_response.text;
+      }
+
+      // BeforeToolSelection.hookSpecificOutput.toolConfig
+      if (hso.toolConfig !== undefined) {
+        updated.toolConfig = hso.toolConfig;
+        if (Array.isArray(hso.toolConfig.allowedFunctionNames)) {
+          if (updated.capabilities) {
+            updated.capabilities = updated.capabilities.filter(c => 
+              hso.toolConfig.allowedFunctionNames.includes(c.name) || 
+              hso.toolConfig.allowedFunctionNames.includes(c.id)
+            );
+          }
+        }
+      }
+
+      // SessionStart / BeforeAgent / AfterTool.hookSpecificOutput.additionalContext
+      if (hso.additionalContext !== undefined) {
+        updated.additionalContext = hso.additionalContext;
+      }
+    }
+
+    // 2. Propagate top-level fields
+    const checkFields = [
+      'prompt',
+      'capabilities',
+      'config',
+      'query',
+      'text',
+      'executionPrompt',
+      'result',
+      'finalAnswer',
+      'decision',
+      'reason',
+      'continue',
+      'clearContext',
+      'systemMessage',
+      'retry',
+      'retryPrompt',
+      'tool_input',
+      'tool_response',
+      'llm_request',
+      'llm_response'
+    ];
+    for (const field of checkFields) {
+      if (hookResult[field] !== undefined) {
+        updated[field] = hookResult[field];
+      }
+    }
+
+    // Direct mappings for Gemini CLI compatibility:
+    // If continue is false, treat it as decision: "deny"
+    if (hookResult.continue === false) {
+      updated.decision = "deny";
+      updated.reason = hookResult.reason || "Execution stopped by hook continue=false";
+    }
+
+    return updated;
+  }
+
+  /**
+   * Executes all matching hooks for a specific lifecycle event.
+   * Auto-injects standard environment and session metadata to align with Gemini CLI specs.
+   *
+   * @param {string} event - The lifecycle event name.
+   * @param {Object} initialInput - The initial HookInput payload.
+   * @returns {Object} The aggregated output/result of hook execution.
+   */
+  execute(event, initialInput) {
+    // Construct normalized Gemini CLI payload containing the mandatory common properties
+    const input = {
+      session_id: initialInput.session_id || this.sessionId,
+      transcript_path: initialInput.transcript_path || "/mock/transcript.jsonl",
+      cwd: initialInput.cwd || "/mock/cwd",
+      hook_event_name: event,
+      timestamp: new Date().toISOString(),
+      ...initialInput,
+      event // Keep camelCase compatibility field
+    };
+
+    // Normalize event-specific payloads (mappings to standard Gemini CLI snake_case fields)
+    if (event === "BeforeTool" || event === "AfterTool") {
+      input.tool_name = input.tool_name || input.toolName || "";
+      if (input.tool_input === undefined) {
+        input.tool_input = {
+          execution_prompt: input.executionPrompt || input.prompt || "",
+          task: input.task || {}
+        };
+      }
+      if (event === "AfterTool" && input.tool_response === undefined) {
+        input.tool_response = {
+          result: input.result || "",
+          success: !input.error,
+          error: input.error || null
+        };
+      }
+    } else if (event === "BeforeModel" || event === "AfterModel") {
+      if (input.llm_request === undefined) {
+        input.llm_request = {
+          model: input.config?.model || "",
+          messages: input.history || [],
+          config: input.config || {}
+        };
+      }
+      if (event === "AfterModel" && input.llm_response === undefined) {
+        input.llm_response = {
+          text: input.text || ""
+        };
+      }
+    } else if (event === "BeforeToolSelection") {
+      if (input.llm_request === undefined) {
+        input.llm_request = {
+          capabilities: input.capabilities || []
+        };
+      }
+    } else if (event === "AfterAgent") {
+      input.prompt_response = input.prompt_response || input.finalAnswer || "";
+      input.stop_hook_active = input.stop_hook_active !== undefined ? input.stop_hook_active : false;
+    }
+
+    // Find all hooks that target this lifecycle event
+    const matchingHooks = this.hooks.filter(h => {
+      const eventMatches = Array.isArray(h.event) ? h.event.includes(event) : (h.event === event);
+      if (!eventMatches) return false;
+
+      // Matcher filter (mostly used for BeforeTool, AfterTool, Notification matching)
+      if (h.matcher) {
+        const toolName = input.tool_name || input.toolName || input.capabilityId || "";
+        if (!this._isMatch(h.matcher, toolName)) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    if (matchingHooks.length === 0) {
+      return input;
+    }
+
+    let currentInput = { ...input };
+    let decisions = [];
+    let reasons = [];
+    let contexts = [];
+    
+    for (const hook of matchingHooks) {
+      // If sequential, pass the latest state; otherwise, pass the original input state.
+      const hookInput = hook.sequential ? currentInput : { ...input };
+      
+      let result = null;
+      try {
+        result = this._executeSingleHook(hook, hookInput);
+      } catch (err) {
+        console.error(`[HookManager Error] Failed executing hook '${hook.name}': ${err.message}`);
+        result = { decision: "deny", reason: `Execution failure in hook '${hook.name}': ${err.message}` };
+      }
+
+      if (!result) continue;
+
+      if (result.decision) {
+        decisions.push(result.decision);
+      }
+      if (result.reason) {
+        reasons.push(result.reason);
+      }
+      
+      // Keep namespace or top-level additionalContext / systemMessage
+      const contextVal = result.hookSpecificOutput?.additionalContext || result.additionalContext;
+      if (contextVal) {
+        contexts.push(contextVal);
+      }
+      const sysMsg = result.systemMessage;
+      if (sysMsg) {
+        contexts.push(sysMsg);
+      }
+
+      // Propagate modified fields
+      currentInput = this._mergeSequentialInput(currentInput, result);
+    }
+
+    // Merge & Aggregate:
+    // - OR Decision: If any hook returns decision: "deny" or decision: "block", reject immediately. Combine reason strings.
+    // - Concat Context: Concatenate additionalContext or systemMessage strings using newlines (\n).
+    const finalResult = { ...currentInput };
+    
+    const hasDeny = decisions.some(d => d === "deny" || d === "block");
+    if (hasDeny) {
+      finalResult.decision = "deny";
+      finalResult.reason = reasons.filter(r => r).join("\n");
+    } else if (decisions.length > 0) {
+      finalResult.decision = "allow";
+    }
+
+    if (contexts.length > 0) {
+      finalResult.additionalContext = contexts.filter(c => c).join("\n");
+    }
+
+    return finalResult;
+  }
+};
+
+
 /**
  * LlmAgent.js
- * [Production Release v1.3.4] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
+ * [Production Release v1.3.5] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -51,6 +518,8 @@
  * });
  * agent.setServices({ lock: LockService.getScriptLock() });
  */
+var gasGlobalContext = this;
+
 var LlmAgent = class LlmAgent {
   constructor(config = {}) {
     this.apiKey = config.apiKey;
@@ -90,6 +559,10 @@ var LlmAgent = class LlmAgent {
     this.outputSchema = config.outputSchema || null;
     this.logSpreadsheetId = config.logSpreadsheetId || ""; // Propagated down to MCPApp and A2AApp in v1.3.3
 
+    // Hooks System
+    this.hookManager = new GasHookManager(config.hooks || []);
+    this.sessionId = "session_" + (typeof Utilities !== "undefined" ? Utilities.getUuid() : Math.random().toString(36).substring(2));
+
     // Internal state
     this.history = [];
     this.logs = [];
@@ -98,8 +571,64 @@ var LlmAgent = class LlmAgent {
     this._capabilitiesInitialized = false;
   }
 
+  /**
+   * Helper to execute prompt against model, wrapped with BeforeModel and AfterModel hooks.
+   *
+   * @param {Object} config - Gemini configuration object.
+   * @param {string} query - The prompt query.
+   * @returns {string} The output text.
+   * @private
+   */
+  _generateContent(config, query) {
+    // Construct request metadata to pass to BeforeModel
+    const beforeResult = this.hookManager.execute("BeforeModel", {
+      config,
+      query,
+      history: this.history || [],
+      model: this.model
+    });
+
+    if (beforeResult.decision === "deny") {
+      throw new Error(`Model request blocked by BeforeModel hook.`);
+    }
+
+    const activeConfig = beforeResult.config || config;
+    const activeQuery = beforeResult.query || query;
+
+    let text;
+    // Check if the hook returned a mocked llm_response (allowing API call skip)
+    const mockedResponse = beforeResult.hookSpecificOutput?.llm_response || beforeResult.llm_response;
+    if (mockedResponse && mockedResponse.text !== undefined) {
+      text = mockedResponse.text;
+    } else {
+      text = new GeminiWithFiles(activeConfig).generateContent({ q: activeQuery });
+    }
+
+    // Call AfterModel with request and response details
+    const afterResult = this.hookManager.execute("AfterModel", {
+      config: activeConfig,
+      query: activeQuery,
+      history: this.history || [],
+      model: this.model,
+      text: text
+    });
+
+    if (afterResult.decision === "deny") {
+      throw new Error(`Model response blocked and discarded by AfterModel hook.`);
+    }
+
+    const modifiedResponse = afterResult.hookSpecificOutput?.llm_response || afterResult.llm_response;
+    if (modifiedResponse && modifiedResponse.text !== undefined) {
+      return modifiedResponse.text;
+    }
+    return afterResult.text !== undefined ? afterResult.text : text;
+  }
+
   setServices(services = {}) {
     this.services = services;
+    if (this.services.globalContext && this.hookManager) {
+      this.hookManager.setGlobalContext(this.services.globalContext);
+    }
     this._initializeCapabilities();
     return this;
   }
@@ -198,6 +727,7 @@ var LlmAgent = class LlmAgent {
     const log = (message, data = null) => {
       const entry = { timestamp: new Date().toISOString(), message, data };
       this.logs.push(entry);
+      this.hookManager.execute("Notification", { message, data, toolName: data?.capability_id || "" });
       if (logCallback) logCallback(entry);
     };
 
@@ -463,16 +993,17 @@ var LlmAgent = class LlmAgent {
 
   _executeTask(cap, executionPrompt) {
     if (!cap) {
-      const g = new GeminiWithFiles({
+      const config = {
         apiKey: this.apiKey,
         model: this.model,
         history: [...this.history],
-      });
-      return g.generateContent({ q: executionPrompt });
+      };
+      return this._generateContent(config, executionPrompt);
     }
 
     switch (cap.type) {
       case "Native Tool": {
+        const self = this;
         const funcs = {
           params_: {
             [cap.name]: {
@@ -481,14 +1012,59 @@ var LlmAgent = class LlmAgent {
             },
           },
         };
-        funcs[cap.name] = cap._tool.function;
-        const g = new GeminiWithFiles({
+        
+        // Wrap the native function with BeforeTool/AfterTool hook handlers to catch actual arguments
+        funcs[cap.name] = function(args) {
+          // 1. EXECUTE BeforeTool Hook with actual LLM-generated arguments
+          const beforeToolRes = self.hookManager.execute("BeforeTool", {
+            prompt: self.currentPrompt || "",
+            toolName: cap.name,
+            tool_name: cap.name,
+            tool_input: args,
+            capabilityId: cap.id,
+            capability: cap
+          });
+          
+          if (beforeToolRes.decision === "deny" || beforeToolRes.continue === false) {
+            throw new Error(`Execution blocked by BeforeTool hook: ${beforeToolRes.reason || "Denied tool execution"}`);
+          }
+          
+          // Apply modified arguments if hook returned them
+          const activeArgs = beforeToolRes.hookSpecificOutput?.tool_input || beforeToolRes.tool_input || args;
+          
+          // Run the original function
+          let result = cap._tool.function(activeArgs);
+          
+          // 2. EXECUTE AfterTool Hook with execution result
+          const afterToolRes = self.hookManager.execute("AfterTool", {
+            prompt: self.currentPrompt || "",
+            toolName: cap.name,
+            tool_name: cap.name,
+            tool_input: activeArgs,
+            tool_response: { result: result },
+            result: result,
+            capability: cap
+          });
+          
+          if (afterToolRes.decision === "deny" || afterToolRes.continue === false) {
+            return `[Interception Blocked/Redacted] ${afterToolRes.reason || "Tool output was hidden by hook policy."}`;
+          }
+          
+          let finalResult = afterToolRes.result !== undefined ? afterToolRes.result : result;
+          const additionalToolContext = afterToolRes.hookSpecificOutput?.additionalContext || afterToolRes.additionalContext;
+          if (additionalToolContext) {
+            finalResult = finalResult + "\n\n[Hook Context]:\n" + additionalToolContext;
+          }
+          return finalResult;
+        };
+
+        const config = {
           apiKey: this.apiKey,
           model: this.model,
           functions: funcs,
           history: [...this.history],
-        });
-        return g.generateContent({ q: executionPrompt });
+        };
+        return this._generateContent(config, executionPrompt);
       }
       case "MCP Server": {
         const mcpConfig = {};
@@ -536,24 +1112,24 @@ var LlmAgent = class LlmAgent {
         }
         return cap._agent.run(executionPrompt);
       case "Agent Skill": {
-        const g = new GeminiWithFiles({
+        const config = {
           apiKey: this.apiKey,
           model: this.model,
           systemInstruction: {
             parts: [{ text: `Strictly apply this skill:\n\n${cap.content}` }],
           },
           history: [...this.history],
-        });
-        return g.generateContent({ q: executionPrompt });
+        };
+        return this._generateContent(config, executionPrompt);
       }
       case "Built-in Tool": {
-        const g = new GeminiWithFiles({
+        const config = {
           apiKey: this.apiKey,
           model: this.model,
           tools: [cap._tool],
           history: [...this.history],
-        });
-        return g.generateContent({ q: executionPrompt });
+        };
+        return this._generateContent(config, executionPrompt);
       }
       default:
         throw new Error(`Unknown capability: ${cap.type}`);
@@ -561,89 +1137,155 @@ var LlmAgent = class LlmAgent {
   }
 
   run(prompt, logCallback = null) {
-    this.startTime = Date.now();
+    try {
+      this.startTime = Date.now();
+      this.currentPrompt = prompt;
 
-    const log = (message, data = null) => {
-      const entry = { timestamp: new Date().toISOString(), message, data };
-      this.logs.push(entry);
-      if (typeof logCallback === "function") logCallback(entry);
-    };
+      // Sync sessionId to hookManager
+      if (this.hookManager) {
+        this.hookManager.sessionId = this.sessionId || this.hookManager.sessionId;
+      }
 
-    if (!this._capabilitiesInitialized) this._initializeCapabilities(log);
-    log("Agent run sequence initiated", { prompt });
+      // EXECUTE SessionStart Hook
+      const sessionStartRes = this.hookManager.execute("SessionStart", { prompt, source: "startup" });
+      prompt = sessionStartRes.prompt || prompt;
+      const sessionContext = sessionStartRes.hookSpecificOutput?.additionalContext || sessionStartRes.additionalContext;
+      if (sessionContext) {
+        prompt = prompt + "\n\n[Session Start Context]:\n" + sessionContext;
+      }
 
-    // Global Context Hoisting
-    const temporalContext = `\n[System Time Anchor]: Current system date/time is ${new Date().toString()}. Use this as the baseline for relative time references.`;
+      const log = (message, data = null) => {
+        const entry = { timestamp: new Date().toISOString(), message, data };
+        this.logs.push(entry);
+        
+        const notifyRes = this.hookManager.execute("Notification", { 
+          message, 
+          data, 
+          toolName: data?.capability_id || "",
+          notification_type: "Log",
+          details: data
+        });
+        
+        if (notifyRes.systemMessage && typeof logCallback === "function") {
+          logCallback({ timestamp: new Date().toISOString(), message: `[Hook Notification Message] ${notifyRes.systemMessage}`, data });
+        }
+        if (typeof logCallback === "function") logCallback(entry);
+      };
 
-    let globalInstruction = `You are an autonomous orchestrator agent. Designation: "${this.name}".${temporalContext}\n`;
-    let baseInstruction = this.instruction;
-    if (this.state && typeof baseInstruction === "string") {
-      baseInstruction = baseInstruction.replace(/{(\w+)}/g, (match, key) =>
-        this.state[key] !== undefined ? this.state[key] : match,
-      );
-    }
-    if (baseInstruction)
-      globalInstruction += `User Persona & Core Instructions: ${typeof baseInstruction === "string" ? baseInstruction : JSON.stringify(baseInstruction)}\n`;
+      if (sessionStartRes.systemMessage) {
+        log(`[SessionStart Hook Message] ${sessionStartRes.systemMessage}`);
+      }
 
-    // Capability Compaction
-    const plannerCapabilities = this.capabilities.map((c) => ({
-      id: c.id,
-      type: c.type,
-      name: c.name,
-      description: c.description,
-    }));
-    const capabilityIds = this.capabilities.map((c) => c.id);
+      if (!this._capabilitiesInitialized) this._initializeCapabilities(log);
+      log("Agent run sequence initiated", { prompt });
 
-    // Unified Schema Definitions
-    const taskArraySchema = {
-      type: "array",
-      items: {
+      // EXECUTE PreCompress Hook (Standard lifecycle alignment)
+      const preCompressRes = this.hookManager.execute("PreCompress", { trigger: "auto" });
+      if (preCompressRes.systemMessage) {
+        log(`[PreCompress Hook Message] ${preCompressRes.systemMessage}`);
+      }
+
+      // EXECUTE BeforeAgent Hook
+      const beforeAgentRes = this.hookManager.execute("BeforeAgent", { prompt });
+      if (beforeAgentRes.decision === "deny" || beforeAgentRes.continue === false) {
+        throw new Error(`Execution blocked by BeforeAgent hook: ${beforeAgentRes.reason || "Denied"}`);
+      }
+      
+      const agentContext = beforeAgentRes.hookSpecificOutput?.additionalContext || beforeAgentRes.additionalContext;
+      if (agentContext) {
+        prompt = prompt + "\n\n[Additional Context]:\n" + agentContext;
+      } else if (beforeAgentRes.prompt) {
+        prompt = beforeAgentRes.prompt;
+      }
+
+      // Global Context Hoisting
+      const temporalContext = `\n[System Time Anchor]: Current system date/time is ${new Date().toString()}. Use this as the baseline for relative time references.`;
+
+      let globalInstruction = `You are an autonomous orchestrator agent. Designation: "${this.name}".${temporalContext}\n`;
+      let baseInstruction = this.instruction;
+      if (this.state && typeof baseInstruction === "string") {
+        baseInstruction = baseInstruction.replace(/{(\w+)}/g, (match, key) =>
+          this.state[key] !== undefined ? this.state[key] : match,
+        );
+      }
+      if (baseInstruction)
+        globalInstruction += `User Persona & Core Instructions: ${typeof baseInstruction === "string" ? baseInstruction : JSON.stringify(baseInstruction)}\n`;
+
+      // Capability Compaction
+      const plannerCapabilities = this.capabilities.map((c) => ({
+        id: c.id,
+        type: c.type,
+        name: c.name,
+        description: c.description,
+      }));
+
+      // EXECUTE BeforeToolSelection Hook
+      const beforeToolSelectionRes = this.hookManager.execute("BeforeToolSelection", { capabilities: plannerCapabilities });
+      let activeCapabilities = beforeToolSelectionRes.capabilities || plannerCapabilities;
+      
+      const toolConfig = beforeToolSelectionRes.hookSpecificOutput?.toolConfig || beforeToolSelectionRes.toolConfig;
+      if (toolConfig) {
+        if (toolConfig.mode === "NONE") {
+          activeCapabilities = [];
+        } else if (Array.isArray(toolConfig.allowedFunctionNames)) {
+          activeCapabilities = activeCapabilities.filter(c => 
+            toolConfig.allowedFunctionNames.includes(c.name) || 
+            toolConfig.allowedFunctionNames.includes(c.id)
+          );
+        }
+      }
+      const capabilityIds = activeCapabilities.map((c) => c.id);
+
+      // Unified Schema Definitions
+      const taskArraySchema = {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            task_id: { type: "number" },
+            description: { type: "string" },
+            capability_id: { type: "string", enum: capabilityIds },
+            execution_prompt: { type: "string" },
+            depends_on: {
+              type: "array",
+              items: { type: "number" },
+              description: "Task IDs this task depends on.",
+            },
+          },
+          required: [
+            "task_id",
+            "description",
+            "capability_id",
+            "execution_prompt",
+            "depends_on",
+          ],
+        },
+      };
+
+      const plannerSchema = {
         type: "object",
         properties: {
-          task_id: { type: "number" },
-          description: { type: "string" },
-          capability_id: { type: "string", enum: capabilityIds },
-          execution_prompt: { type: "string" },
-          depends_on: {
-            type: "array",
-            items: { type: "number" },
-            description: "Task IDs this task depends on.",
+          requires_capabilities: {
+            type: "boolean",
+            description: "True ONLY if external tools are strictly required.",
           },
+          direct_answer: {
+            type: "string",
+            description:
+              "If requires_capabilities is false, provide the final comprehensive answer here directly to the user.",
+          },
+          plan: taskArraySchema,
         },
-        required: [
-          "task_id",
-          "description",
-          "capability_id",
-          "execution_prompt",
-          "depends_on",
-        ],
-      },
-    };
+        required: ["requires_capabilities"],
+      };
 
-    const plannerSchema = {
-      type: "object",
-      properties: {
-        requires_capabilities: {
-          type: "boolean",
-          description: "True ONLY if external tools are strictly required.",
-        },
-        direct_answer: {
-          type: "string",
-          description:
-            "If requires_capabilities is false, provide the final comprehensive answer here directly to the user.",
-        },
-        plan: taskArraySchema,
-      },
-      required: ["requires_capabilities"],
-    };
-
-    const plannerPromptStr = `
+      const plannerPromptStr = `
 Objective: Decompose the user's prompt into tasks and assign MINIMAL necessary capabilities.
 
 User Prompt: "${prompt}"
 
 Available Capabilities:
-${JSON.stringify(plannerCapabilities, null, 2)}
+${JSON.stringify(activeCapabilities, null, 2)}
 
 Instructions:
 1. Decompose the prompt into sequential tasks. Select exactly ONE capability per task by its "id".
@@ -654,191 +1296,267 @@ Instructions:
 5. BAN ON SYNTHESIS TASKS (CRITICAL): Do NOT create tasks for compiling, summarizing, formatting, or synthesizing the final answer. The system automatically executes a final synthesis phase using all gathered data. Create tasks ONLY for actively executing tools or fetching data.
 `;
 
-    log("Planning phase initiated.");
-    const plannerConfig = {
-      apiKey: this.apiKey,
-      model: this.model,
-      history: this.history,
-      systemInstruction: { parts: [{ text: globalInstruction }] },
-      responseSchema: plannerSchema,
-    };
+      log("Planning phase initiated.");
+      const plannerConfig = {
+        apiKey: this.apiKey,
+        model: this.model,
+        history: this.history,
+        systemInstruction: { parts: [{ text: globalInstruction }] },
+        responseSchema: plannerSchema,
+      };
 
-    let planResultText;
-    try {
-      planResultText = new GeminiWithFiles(plannerConfig).generateContent({
-        q: plannerPromptStr,
-      });
-    } catch (e) {
-      throw new Error(`Initial Planning Phase Error: ${e.message}`);
-    }
+      let planResultText;
+      try {
+        planResultText = this._generateContent(plannerConfig, plannerPromptStr);
+      } catch (e) {
+        throw new Error(`Initial Planning Phase Error: ${e.message}`);
+      }
 
-    let planResult;
-    try {
-      planResult = this._extractJson(planResultText);
-    } catch (e) {
-      throw new Error(
-        `Invalid JSON returned from Planner: ${e.message}\nRaw Output: ${planResultText}`,
-      );
-    }
-
-    let planQueue = [];
-    let taskResults = [];
-    let replanCount = 0;
-
-    // ==========================================
-    // ZERO-SYNTHESIS BYPASS & SCHEMA INTERCEPTION
-    // ==========================================
-    if (planResult.requires_capabilities === false) {
-      const directAns =
-        planResult.direct_answer || "No capabilities required to answer.";
-
-      // Intercept bypass if outputSchema is demanded to ensure strict formatting
-      if (this.outputSchema) {
-        log(
-          "One-Pass Fast-Track intercepted: 'outputSchema' is defined. Routing to Synthesis for strict formatting.",
+      let planResult;
+      try {
+        planResult = this._extractJson(planResultText);
+      } catch (e) {
+        throw new Error(
+          `Invalid JSON returned from Planner: ${e.message}\nRaw Output: ${planResultText}`,
         );
-        taskResults.push({
-          task_id: 0,
-          capability_used: "None",
-          capability_type: "None",
-          prompt: prompt,
-          result: directAns,
-          duration_ms: 0,
-        });
-        // planQueue remains empty, dropping immediately into the final Synthesis loop
+      }
+
+      let planQueue = [];
+      let taskResults = [];
+      let replanCount = 0;
+
+      // ==========================================
+      // ZERO-SYNTHESIS BYPASS & SCHEMA INTERCEPTION
+      // ==========================================
+      if (planResult.requires_capabilities === false) {
+        const directAns =
+          planResult.direct_answer || "No capabilities required to answer.";
+
+        // Intercept bypass if outputSchema is demanded to ensure strict formatting
+        if (this.outputSchema) {
+          log(
+            "One-Pass Fast-Track intercepted: 'outputSchema' is defined. Routing to Synthesis for strict formatting.",
+          );
+          taskResults.push({
+            task_id: 0,
+            capability_used: "None",
+            capability_type: "None",
+            prompt: prompt,
+            result: directAns,
+            duration_ms: 0,
+          });
+          // planQueue remains empty, dropping immediately into the final Synthesis loop
+        } else {
+          log(
+            "One-Pass Fast-Track Triggered: Bypassing execution and synthesis entirely.",
+          );
+          
+          let agentResult = directAns;
+
+          // EXECUTE AfterAgent Hook
+          const afterAgentRes = this.hookManager.execute("AfterAgent", {
+            finalAnswer: agentResult,
+            prompt_response: agentResult,
+            prompt: prompt,
+            stop_hook_active: false
+          });
+          
+          let forceRetry = (afterAgentRes.decision === "deny" || afterAgentRes.continue === false || afterAgentRes.retry === true);
+          let retryPrompt = afterAgentRes.reason || afterAgentRes.retryPrompt || prompt;
+          agentResult = afterAgentRes.prompt_response || afterAgentRes.finalAnswer || agentResult;
+
+          if (afterAgentRes.clearContext === true) {
+            log("AfterAgent hook requested clearContext: clearing history.");
+            this.history = [];
+          }
+
+          this.history.push({ role: "user", parts: [{ text: prompt }] });
+          this.history.push({ role: "model", parts: [{ text: agentResult }] });
+
+          // EXECUTE SessionEnd Hook
+          const sessionEndRes = this.hookManager.execute("SessionEnd", { 
+            finalAnswer: agentResult, 
+            error: null, 
+            prompt: prompt,
+            reason: "exit"
+          });
+          if (sessionEndRes.systemMessage) {
+            log(`[SessionEnd Hook Message] ${sessionEndRes.systemMessage}`);
+          }
+
+          if (forceRetry && (!this._retryCount || this._retryCount < 2)) {
+            this._retryCount = (this._retryCount || 0) + 1;
+            log(`AfterAgent hook requested retry (decision: deny/retry). Initiating retry ${this._retryCount} with prompt/reason: ${retryPrompt}`);
+            const retryResult = this.run(retryPrompt, logCallback);
+            this._retryCount = 0; // reset
+            return retryResult;
+          }
+
+          return agentResult;
+        }
       } else {
-        log(
-          "One-Pass Fast-Track Triggered: Bypassing execution and synthesis entirely.",
-        );
-        this.history.push({ role: "user", parts: [{ text: prompt }] });
-        this.history.push({ role: "model", parts: [{ text: directAns }] });
-        return directAns;
-      }
-    } else {
-      planQueue = planResult.plan || [];
-      const planSummary = planQueue
-        .map((t) => `Task [${t.task_id}]: '${t.capability_id}'`)
-        .join("\n");
-      log("Execution Plan Generated:\n" + planSummary, { plan: planQueue });
-    }
-
-    let highestTaskId = Math.max(...planQueue.map((t) => t.task_id), 0);
-
-    // ==========================================
-    // ADAPTIVE EXECUTION PHASE
-    // ==========================================
-    while (planQueue.length > 0) {
-      const timeElapsed = Date.now() - this.startTime;
-      if (timeElapsed > this.timeoutMs) {
-        log(
-          `[TIMEOUT PREVENTION] Safe abort triggered. Elapsed: ${timeElapsed}ms exceeds ${this.timeoutMs}ms limit.`,
-        );
-        break;
+        planQueue = planResult.plan || [];
+        const planSummary = planQueue
+          .map((t) => `Task [${t.task_id}]: '${t.capability_id}'`)
+          .join("\n");
+        log("Execution Plan Generated:\n" + planSummary, { plan: planQueue });
       }
 
-      const task = planQueue.shift();
-      log(`Executing Task [${task.task_id}] via [${task.capability_id}]`, {
-        description: task.description,
-      });
+      let highestTaskId = Math.max(...planQueue.map((t) => t.task_id), 0);
 
-      const cap = this.capabilities.find((c) => c.id === task.capability_id);
-
-      let contextStr = "";
-      if (task.depends_on && task.depends_on.length > 0) {
-        const dependentResults = taskResults.filter(
-          (tr) => task.depends_on.includes(tr.task_id) && !tr.error,
-        );
-        if (dependentResults.length > 0)
-          contextStr = `\n\n[Context from dependent tasks]:\n${JSON.stringify(dependentResults)}`;
-      }
-
-      const finalExecutionPrompt = task.execution_prompt + contextStr;
-
-      let rawResultData;
-      let taskError = null;
-      let retries = 1;
-      const taskStartTime = Date.now();
-
-      while (retries >= 0) {
-        try {
-          rawResultData = this._executeTask(cap, finalExecutionPrompt);
-          taskError = null;
+      // ==========================================
+      // ADAPTIVE EXECUTION PHASE
+      // ==========================================
+      while (planQueue.length > 0) {
+        const timeElapsed = Date.now() - this.startTime;
+        if (timeElapsed > this.timeoutMs) {
+          log(
+            `[TIMEOUT PREVENTION] Safe abort triggered. Elapsed: ${timeElapsed}ms exceeds ${this.timeoutMs}ms limit.`,
+          );
           break;
-        } catch (err) {
-          if (retries === 0) {
-            taskError = err.message;
-          } else {
-            log(`Task [${task.task_id}] failed, retrying...`, {
-              error: err.message,
-            });
-            Utilities.sleep(2000);
-            retries--;
+        }
+
+        const task = planQueue.shift();
+        log(`Executing Task [${task.task_id}] via [${task.capability_id}]`, {
+          description: task.description,
+        });
+
+        const cap = this.capabilities.find((c) => c.id === task.capability_id);
+
+        let contextStr = "";
+        if (task.depends_on && task.depends_on.length > 0) {
+          const dependentResults = taskResults.filter(
+            (tr) => task.depends_on.includes(tr.task_id) && !tr.error,
+          );
+          if (dependentResults.length > 0)
+            contextStr = `\n\n[Context from dependent tasks]:\n${JSON.stringify(dependentResults)}`;
+        }
+
+        const finalExecutionPrompt = task.execution_prompt + contextStr;
+
+        let rawResultData;
+        let taskError = null;
+        let retries = 1;
+        const taskStartTime = Date.now();
+
+        // EXECUTE BeforeTool Hook (Skip for Native Tools to avoid early verification with missing args)
+        const isNativeTool = cap && cap.type === "Native Tool";
+        const beforeToolRes = isNativeTool ? { decision: "allow" } : this.hookManager.execute("BeforeTool", {
+          prompt: prompt,
+          toolName: cap ? cap.name : task.capability_id,
+          capabilityId: task.capability_id,
+          executionPrompt: finalExecutionPrompt,
+          task: task,
+          capability: cap
+        });
+
+        if (beforeToolRes.decision === "deny") {
+          taskError = `Execution blocked by BeforeTool hook: ${beforeToolRes.reason || "Denied tool execution"}`;
+          retries = -1; // Prevent retry loop
+        } else {
+          const activeExecutionPrompt = beforeToolRes.executionPrompt || finalExecutionPrompt;
+
+          while (retries >= 0) {
+            try {
+              rawResultData = this._executeTask(cap, activeExecutionPrompt);
+              taskError = null;
+              break;
+            } catch (err) {
+              if (retries === 0) {
+                taskError = err.message;
+              } else {
+                log(`Task [${task.task_id}] failed, retrying...`, {
+                  error: err.message,
+                });
+                Utilities.sleep(2000);
+                retries--;
+              }
+            }
           }
         }
-      }
 
-      const durationMs = Date.now() - taskStartTime;
+        const durationMs = Date.now() - taskStartTime;
 
-      // Result Payload Truncation (Bulletproofing against 400 Payload Too Large)
-      let finalResultData = null;
-      if (!taskError) {
-        let resultStr =
-          typeof rawResultData === "object"
-            ? JSON.stringify(rawResultData)
-            : String(rawResultData);
-        if (resultStr.length > this.maxResultLength) {
-          log(
-            `[PAYLOAD WARNING] Task [${task.task_id}] result length (${resultStr.length}) exceeded limit. Truncating to ${this.maxResultLength} chars.`,
-          );
-          resultStr =
-            resultStr.substring(0, this.maxResultLength) +
-            "\n\n...[TRUNCATED: Exceeds context limit]";
+        // Result Payload Truncation (Bulletproofing against 400 Payload Too Large)
+        let finalResultData = null;
+        if (!taskError) {
+          let resultStr =
+            typeof rawResultData === "object"
+              ? JSON.stringify(rawResultData)
+              : String(rawResultData);
+          if (resultStr.length > this.maxResultLength) {
+            log(
+              `[PAYLOAD WARNING] Task [${task.task_id}] result length (${resultStr.length}) exceeded limit. Truncating to ${this.maxResultLength} chars.`,
+            );
+            resultStr =
+              resultStr.substring(0, this.maxResultLength) +
+              "\n\n...[TRUNCATED: Exceeds context limit]";
+          }
+          finalResultData = resultStr;
+
+          // EXECUTE AfterTool Hook (Skip for Native Tools to avoid double-firing)
+          const afterToolRes = isNativeTool ? { result: finalResultData } : this.hookManager.execute("AfterTool", {
+            prompt: prompt,
+            toolName: cap ? cap.name : task.capability_id,
+            capabilityId: task.capability_id,
+            result: finalResultData,
+            task: task,
+            capability: cap
+          });
+          
+          if (afterToolRes.decision === "deny" || afterToolRes.continue === false) {
+            finalResultData = `[Interception Blocked/Redacted] ${afterToolRes.reason || "Tool output was hidden by hook policy."}`;
+          } else {
+            finalResultData = afterToolRes.result !== undefined ? afterToolRes.result : finalResultData;
+            const additionalToolContext = afterToolRes.hookSpecificOutput?.additionalContext || afterToolRes.additionalContext;
+            if (additionalToolContext) {
+              finalResultData = finalResultData + "\n\n[Hook Context]:\n" + additionalToolContext;
+            }
+          }
         }
-        finalResultData = resultStr;
-      }
 
-      if (!taskError) {
-        taskResults.push({
-          task_id: task.task_id,
-          capability_used: task.capability_id,
-          capability_type: cap ? cap.type : "Unknown",
-          prompt: task.execution_prompt,
-          result: finalResultData,
-          duration_ms: durationMs,
-        });
-        log(
-          `Task [${task.task_id}] completed successfully in ${durationMs}ms.`,
-        );
-      } else {
-        taskResults.push({
-          task_id: task.task_id,
-          capability_used: task.capability_id,
-          capability_type: cap ? cap.type : "Unknown",
-          prompt: task.execution_prompt,
-          error: taskError,
-          duration_ms: durationMs,
-        });
-        log(`Task [${task.task_id}] failed definitively in ${durationMs}ms.`, {
-          error: taskError,
-        });
-
-        // Dynamic Re-Planning Trigger
-        if (replanCount < this.maxReplans) {
-          replanCount++;
+        if (!taskError) {
+          taskResults.push({
+            task_id: task.task_id,
+            capability_used: task.capability_id,
+            capability_type: cap ? cap.type : "Unknown",
+            prompt: task.execution_prompt,
+            result: finalResultData,
+            duration_ms: durationMs,
+          });
           log(
-            `[DYNAMIC RE-PLANNING] Attempt ${replanCount}/${this.maxReplans}. Discarding remaining queue and regenerating DAG...`,
+            `Task [${task.task_id}] completed successfully in ${durationMs}ms.`,
           );
-          planQueue.length = 0;
+        } else {
+          taskResults.push({
+            task_id: task.task_id,
+            capability_used: task.capability_id,
+            capability_type: cap ? cap.type : "Unknown",
+            prompt: task.execution_prompt,
+            error: taskError,
+            duration_ms: durationMs,
+          });
+          log(`Task [${task.task_id}] failed definitively in ${durationMs}ms.`, {
+            error: taskError,
+          });
 
-          const replanPromptStr = `
+          // Dynamic Re-Planning Trigger
+          if (replanCount < this.maxReplans) {
+            replanCount++;
+            log(
+              `[DYNAMIC RE-PLANNING] Attempt ${replanCount}/${this.maxReplans}. Discarding remaining queue and regenerating DAG...`,
+            );
+            planQueue.length = 0;
+
+            const replanPromptStr = `
 [SYSTEM PRIORITY OVERRIDE] Re-plan remaining steps due to failure.
 Original Prompt: "${prompt}"
-Capabilities: ${JSON.stringify(plannerCapabilities, null, 2)}
+Capabilities: ${JSON.stringify(activeCapabilities, null, 2)}
 Successful Tasks: ${JSON.stringify(
-            taskResults.filter((t) => !t.error),
-            null,
-            2,
-          )}
+              taskResults.filter((t) => !t.error),
+              null,
+              2,
+            )}
 
 FAILURE REPORT:
 Failed Capability: ${task.capability_id}
@@ -848,44 +1566,45 @@ Instructions:
 1. Bypass the error. Do NOT use the exact same capability/prompt combination.
 2. Decompose remaining work into sequential tasks strictly starting from task_id: ${highestTaskId + 1}.
 `;
-          try {
-            // Re-planner explicitly uses the Array Schema
-            const replanResText = new GeminiWithFiles({
-              ...plannerConfig,
-              responseSchema: taskArraySchema,
-            }).generateContent({ q: replanPromptStr });
-            const newPlan = this._extractJson(replanResText);
-            planQueue.push(...newPlan);
-            highestTaskId = Math.max(
-              highestTaskId,
-              ...newPlan.map((t) => t.task_id),
+            try {
+              // Re-planner explicitly uses the Array Schema
+              const replanConfig = {
+                ...plannerConfig,
+                responseSchema: taskArraySchema,
+              };
+              const replanResText = this._generateContent(replanConfig, replanPromptStr);
+              const newPlan = this._extractJson(replanResText);
+              planQueue.push(...newPlan);
+              highestTaskId = Math.max(
+                highestTaskId,
+                ...newPlan.map((t) => t.task_id),
+              );
+              log("Re-planning successful. Appended new tasks to queue.", {
+                newPlan,
+              });
+            } catch (replanErr) {
+              log("Re-planning failed. Forcing synthesis.", {
+                error: replanErr.message,
+              });
+              break;
+            }
+          } else {
+            log(
+              "Maximum re-planning limits reached. Continuing with failure state.",
             );
-            log("Re-planning successful. Appended new tasks to queue.", {
-              newPlan,
-            });
-          } catch (replanErr) {
-            log("Re-planning failed. Forcing synthesis.", {
-              error: replanErr.message,
-            });
-            break;
           }
-        } else {
-          log(
-            "Maximum re-planning limits reached. Continuing with failure state.",
-          );
         }
       }
-    }
 
-    log("Execution phase complete. Initiating final synthesis.");
+      log("Execution phase complete. Initiating final synthesis.");
 
-    let timeWarning = "";
-    if (Date.now() - this.startTime > this.timeoutMs) {
-      timeWarning =
-        "\n[CRITICAL SYSTEM WARNING]: Execution was preemptively interrupted to prevent a system timeout. Answer based ONLY on the partial results gathered so far.";
-    }
+      let timeWarning = "";
+      if (Date.now() - this.startTime > this.timeoutMs) {
+        timeWarning =
+          "\n[CRITICAL SYSTEM WARNING]: Execution was preemptively interrupted to prevent a system timeout. Answer based ONLY on the partial results gathered so far.";
+      }
 
-    const synthesizePrompt = `
+      const synthesizePrompt = `
 [SYSTEM: FINAL SYNTHESIS]
 Original User Prompt: "${prompt}"
 
@@ -899,35 +1618,89 @@ Objective:
 3. CRITICAL: Append an "Execution Summary" at the very end of your response detailing the capabilities used, execution order, duration (ms), and prompts. If no capabilities were used, explicitly state "NO capabilities were used".
 `;
 
-    const synthConfig = {
-      apiKey: this.apiKey,
-      model: this.model,
-      history: this.history,
-      systemInstruction: { parts: [{ text: globalInstruction }] },
-    };
-    if (this.outputSchema) synthConfig.responseSchema = this.outputSchema;
-    if (this.generateContentConfig)
-      synthConfig.generationConfig = this.generateContentConfig;
+      const synthConfig = {
+        apiKey: this.apiKey,
+        model: this.model,
+        history: this.history,
+        systemInstruction: { parts: [{ text: globalInstruction }] },
+      };
+      if (this.outputSchema) synthConfig.responseSchema = this.outputSchema;
+      if (this.generateContentConfig)
+        synthConfig.generationConfig = this.generateContentConfig;
 
-    const finalAnswer = new GeminiWithFiles(synthConfig).generateContent({
-      q: synthesizePrompt,
-    });
+      const finalAnswer = this._generateContent(synthConfig, synthesizePrompt);
 
-    log("Final synthesis complete.");
-    this.history.push({ role: "user", parts: [{ text: prompt }] });
-    this.history.push({
-      role: "model",
-      parts: [
-        {
-          text:
-            typeof finalAnswer === "string"
-              ? finalAnswer
-              : JSON.stringify(finalAnswer),
-        },
-      ],
-    });
+      log("Final synthesis complete.");
 
-    return finalAnswer;
+      let agentResult = finalAnswer;
+
+      // EXECUTE AfterAgent Hook
+      const afterAgentRes = this.hookManager.execute("AfterAgent", {
+        finalAnswer: agentResult,
+        prompt_response: agentResult,
+        prompt: prompt,
+        stop_hook_active: false
+      });
+      
+      let forceRetry = (afterAgentRes.decision === "deny" || afterAgentRes.continue === false || afterAgentRes.retry === true);
+      let retryPrompt = afterAgentRes.reason || afterAgentRes.retryPrompt || prompt;
+      agentResult = afterAgentRes.prompt_response || afterAgentRes.finalAnswer || agentResult;
+
+      if (afterAgentRes.clearContext === true) {
+        log("AfterAgent hook requested clearContext: clearing history.");
+        this.history = [];
+      }
+
+      this.history.push({ role: "user", parts: [{ text: prompt }] });
+      this.history.push({
+        role: "model",
+        parts: [
+          {
+            text:
+              typeof agentResult === "string"
+                ? agentResult
+                : JSON.stringify(agentResult),
+          },
+        ],
+      });
+
+      // EXECUTE SessionEnd Hook
+      const sessionEndRes = this.hookManager.execute("SessionEnd", { 
+        finalAnswer: agentResult, 
+        error: null, 
+        prompt: prompt,
+        reason: "exit"
+      });
+      if (sessionEndRes.systemMessage) {
+        log(`[SessionEnd Hook Message] ${sessionEndRes.systemMessage}`);
+      }
+
+      if (forceRetry && (!this._retryCount || this._retryCount < 2)) {
+        this._retryCount = (this._retryCount || 0) + 1;
+        log(`AfterAgent hook requested retry (decision: deny/retry). Initiating retry ${this._retryCount} with prompt/reason: ${retryPrompt}`);
+        const retryResult = this.run(retryPrompt, logCallback);
+        this._retryCount = 0; // reset
+        return retryResult;
+      }
+
+      return agentResult;
+    } catch (err) {
+      // EXECUTE SessionEnd Hook on error
+      try {
+        const sessionEndRes = this.hookManager.execute("SessionEnd", { 
+          finalAnswer: null, 
+          error: err.message, 
+          prompt: prompt,
+          reason: "error"
+        });
+        if (sessionEndRes.systemMessage) {
+          console.log(`[SessionEnd Hook Message on Error] ${sessionEndRes.systemMessage}`);
+        }
+      } catch (endErr) {
+        console.error(`[HookManager Error] Failed executing SessionEnd hook on error: ${endErr.message}`);
+      }
+      throw err;
+    }
   }
 };
 
@@ -1837,7 +2610,7 @@ const toLog_ = (kind, text) => {
  *
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.7.0 (Direct JSON-RPC Bypass Optimization)
+ * Version: 2.8.0 (Direct JSON-RPC Bypass Optimization & Dynamic Logging Routing)
  * GitHub: https://github.com/tanaikech/A2AApp
  * @class
  */
@@ -1880,8 +2653,10 @@ var A2AApp = class A2AApp {
       const ss = spreadsheetId
         ? SpreadsheetApp.openById(spreadsheetId)
         : SpreadsheetApp.create("Log_A2AApp");
+      const targetSheetName = spreadsheetId ? "A2A" : "log";
+      const headers = ["Date", "Phase/Method", "ID", "Direction", "Message"];
       /** @private */
-      this.sheet = ss.getSheetByName("log") || ss.insertSheet("log");
+      this.sheet = this._getOrCreateSheet(ss, targetSheetName, headers);
     }
 
     /** @private */
@@ -1934,6 +2709,40 @@ var A2AApp = class A2AApp {
     this.lock = this.lock || LockService.getScriptLock();
     this.properties =
       this.properties || PropertiesService.getScriptProperties();
+  }
+
+  /**
+   * Safely gets or creates a sheet under a script lock to prevent concurrency errors.
+   * @private
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - The spreadsheet object.
+   * @param {string} name - The sheet name.
+   * @param {Array<string>} headers - Headers to add if creating.
+   * @return {GoogleAppsScript.Spreadsheet.Sheet}
+   */
+  _getOrCreateSheet(ss, name, headers) {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      const lock = LockService.getScriptLock();
+      let lockAcquired = false;
+      try {
+        lockAcquired = lock.tryLock(15000);
+        sheet = ss.getSheetByName(name);
+        if (!sheet) {
+          sheet = ss.insertSheet(name);
+          if (headers && headers.length > 0) {
+            sheet.appendRow(headers);
+            sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+          }
+        }
+      } catch (e) {
+        sheet = ss.getSheetByName(name) || ss.getSheets()[0];
+      } finally {
+        if (lockAcquired) {
+          lock.releaseLock();
+        }
+      }
+    }
+    return sheet;
   }
 
   /**
@@ -2059,7 +2868,9 @@ var A2AApp = class A2AApp {
         "[Phase 1: Concurrency Control] Timeout. Lock could not be acquired.";
       console.error(msg);
       const errObj = {
-        error: { message: `Internal server error. Error message: ${msg}` },
+        error: {
+          message: `[A2A Client Error] Internal server error. Error message: ${msg}`,
+        },
       };
       this.addLog_(
         new Date(),
@@ -2115,7 +2926,7 @@ var A2AApp = class A2AApp {
       console.error(err.stack);
       const errObj = {
         error: {
-          message: `Internal server error. Error message: ${err.stack}`,
+          message: `[A2A Client Error] Internal server error. Error message: ${err.stack}`,
         },
       };
       this.addLog_(
@@ -2168,7 +2979,10 @@ var A2AApp = class A2AApp {
   createErrorResponse_(message, id, phaseOrMethod) {
     const errObj = {
       jsonrpc: this.jsonrpc,
-      error: { code: this.ErrorCode["Internal server error"], message },
+      error: {
+        code: this.ErrorCode["Internal server error"],
+        message: `[A2A Server Error] ${message}`,
+      },
       id,
     };
     this.addLog_(
@@ -2211,7 +3025,9 @@ var A2AApp = class A2AApp {
         "Received request for Agent Card.",
       );
       if (typeof agentCard !== "function") {
-        throw new Error("Agent card was not found or is not a function.");
+        throw new Error(
+          "[A2A Server Error] Agent card was not found or is not a function.",
+        );
       }
       const agentCardObj = agentCard();
 
@@ -2272,7 +3088,7 @@ var A2AApp = class A2AApp {
         jsonrpc: this.jsonrpc,
         error: {
           code: this.ErrorCode["Authorization failed"],
-          message: `Authorization failed. ${errMsg}`,
+          message: `[A2A Server Error] Authorization failed. ${errMsg}`,
         },
         id,
       };
@@ -3056,7 +3872,8 @@ var A2AApp = class A2AApp {
       const errObj = {
         error: {
           code: this.ErrorCode["Internal server error"],
-          message: "Internal server error. Execution Order Generation Failed.",
+          message:
+            "[A2A Client Error] Internal server error. Execution Order Generation Failed.",
         },
         jsonrpc: this.jsonrpc,
         id: null,
@@ -3480,8 +4297,8 @@ var A2AApp = class A2AApp {
  * Class object for MCP (Model Context Protocol).
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.2.0
- * Date: 2026-05-19
+ * Version: 2.3.0 (Multi-Channel Sheet Logging Update)
+ * Date: 2026-06-10
  * GitHub: https://github.com/tanaikech/MCPApp
  * @class
  */
@@ -3490,7 +4307,7 @@ var MCPApp = class MCPApp {
    * @param {Object} object - Object used to initialize this script.
    * @param {string} [object.accessKey=null] - Default is null. Used for accessing the Web Apps.
    * @param {boolean}[object.log=false] - Default is false. When true, the log between the MCP client and server is stored in Google Sheets.
-   * @param {string} [object.spreadsheetId] - Spreadsheet ID. Logs are stored in the "log" sheet of this spreadsheet.
+   * @param {string} [object.spreadsheetId] - Spreadsheet ID. Logs are stored in the "MCP" sheet of this spreadsheet if provided, otherwise "log" sheet.
    * @param {boolean} [object.lock=true] - Default is true. By default, the script runs with LockService to prevent concurrency issues.
    * @return {MCPApp}
    */
@@ -3537,9 +4354,11 @@ var MCPApp = class MCPApp {
       const ss = spreadsheetId
         ? SpreadsheetApp.openById(spreadsheetId)
         : SpreadsheetApp.create("Log_MCPApp");
+      const targetSheetName = spreadsheetId ? "MCP" : "log";
+      const headers = ["Date", "Method", "ID", "Direction", "Message"];
 
       /** @private */
-      this.sheet = ss.getSheetByName("log") || ss.insertSheet("log");
+      this.sheet = this._getOrCreateSheet(ss, targetSheetName, headers);
     }
 
     /** @private */
@@ -3552,6 +4371,42 @@ var MCPApp = class MCPApp {
 
     /** @private */
     this.clientObject = {};
+  }
+
+  /**
+   * ### Description
+   * Thread-safe helper to retrieve or create a log sheet with custom headers under concurrent lock.
+   *
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - The Google Spreadsheet instance.
+   * @param {string} name - The target sheet name.
+   * @param {string[]} [headers] - Optional headers for a newly created sheet.
+   * @return {GoogleAppsScript.Spreadsheet.Sheet}
+   * @private
+   */
+  _getOrCreateSheet(ss, name, headers) {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      const lock = LockService.getScriptLock();
+      let lockAcquired = false;
+      try {
+        lockAcquired = lock.tryLock(15000);
+        sheet = ss.getSheetByName(name);
+        if (!sheet) {
+          sheet = ss.insertSheet(name);
+          if (headers && headers.length > 0) {
+            sheet.appendRow(headers);
+            sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+          }
+        }
+      } catch (e) {
+        sheet = ss.getSheetByName(name) || ss.getSheets()[0];
+      } finally {
+        if (lockAcquired) {
+          lock.releaseLock();
+        }
+      }
+    }
+    return sheet;
   }
 
   /**
@@ -3738,7 +4593,7 @@ var MCPApp = class MCPApp {
           retObj = {
             error: {
               code: this.ErrorCode.InternalError,
-              message: error.stack || String(error),
+              message: `[MCP Server Error] ${error.stack || String(error)}`,
             },
             jsonrpc: this.jsonrpc,
           };
@@ -3767,7 +4622,7 @@ var MCPApp = class MCPApp {
         retObj = {
           error: {
             code: this.ErrorCode.InvalidParams,
-            message: `No prompt found with name "${resName}".`,
+            message: `[MCP Server Error] No prompt found with name "${resName}".`,
           },
           jsonrpc: this.jsonrpc,
           id,
@@ -3826,7 +4681,7 @@ var MCPApp = class MCPApp {
           retObj = {
             error: {
               code: this.ErrorCode.MethodNotFound,
-              message: `Method or Function "${method}" could not be executed.`,
+              message: `[MCP Server Error] Method or Function "${method}" could not be executed.`,
             },
             jsonrpc: this.jsonrpc,
           };
@@ -3835,7 +4690,7 @@ var MCPApp = class MCPApp {
         retObj = {
           error: {
             code: this.ErrorCode.InternalError,
-            message: error.stack || String(error),
+            message: `[MCP Server Error] ${error.stack || String(error)}`,
           },
           jsonrpc: this.jsonrpc,
         };
@@ -4205,7 +5060,7 @@ var MCPApp = class MCPApp {
         error: {
           code: this.ErrorCode.InternalError,
           message:
-            "Internal planning error. The model returned no execution strategy.",
+            "[MCP Client Error] Internal planning error. The model returned no execution strategy.",
         },
         jsonrpc: this.jsonrpc,
         id: this.id,
@@ -4593,7 +5448,11 @@ var MCPApp = class MCPApp {
       id: this.id,
     });
     return this.mcpServerObj.map(({ serverUrl, headers }) =>
-      this.createRequest_({ u: serverUrl, obj: payloadStr, customHeaders: headers }),
+      this.createRequest_({
+        u: serverUrl,
+        obj: payloadStr,
+        customHeaders: headers,
+      }),
     );
   }
 
@@ -4672,7 +5531,11 @@ var MCPApp = class MCPApp {
 
     const fetchWrapper = ({ payload, serverUrl, customHeaders }) => {
       const responseArray = this.fetch_([
-        this.createRequest_({ u: serverUrl, obj: JSON.stringify(payload), customHeaders }),
+        this.createRequest_({
+          u: serverUrl,
+          obj: JSON.stringify(payload),
+          customHeaders,
+        }),
       ]);
       return responseArray[0].getContentText();
     };
@@ -4703,7 +5566,11 @@ var MCPApp = class MCPApp {
                   jsonrpc: this.jsonrpc,
                   id: this.id++,
                 };
-                return fetchWrapper({ payload: dispatchPayload, serverUrl, customHeaders: headers });
+                return fetchWrapper({
+                  payload: dispatchPayload,
+                  serverUrl,
+                  customHeaders: headers,
+                });
               };
             } else if (subKey === "prompts") {
               const propMap = (definition.arguments || []).reduce(
@@ -4734,7 +5601,11 @@ var MCPApp = class MCPApp {
                   jsonrpc: this.jsonrpc,
                   id: this.id++,
                 };
-                return fetchWrapper({ payload: dispatchPayload, serverUrl, customHeaders: headers });
+                return fetchWrapper({
+                  payload: dispatchPayload,
+                  serverUrl,
+                  customHeaders: headers,
+                });
               };
             } else if (subKey === "tools") {
               toolMetadata = {
@@ -4750,7 +5621,11 @@ var MCPApp = class MCPApp {
                   jsonrpc: this.jsonrpc,
                   id: this.id++,
                 };
-                return fetchWrapper({ payload: dispatchPayload, serverUrl, customHeaders: headers });
+                return fetchWrapper({
+                  payload: dispatchPayload,
+                  serverUrl,
+                  customHeaders: headers,
+                });
               };
             }
 
@@ -4841,13 +5716,17 @@ var MCPApp = class MCPApp {
 
     // Dynamic normalization validating both traditional raw strings and object configurations
     const validServers = (mcpServerUrls || []).reduce((acc, item) => {
-      if (typeof item === 'string' && item.trim() !== '') {
+      if (typeof item === "string" && item.trim() !== "") {
         acc.push({ serverUrl: item.trim(), headers: {}, original: item });
-      } else if (typeof item === 'object' && item !== null) {
+      } else if (typeof item === "object" && item !== null) {
         const key = Object.keys(item)[0];
         const val = item[key];
         if (val && val.httpUrl) {
-          acc.push({ serverUrl: val.httpUrl.trim(), headers: val.headers || {}, original: item });
+          acc.push({
+            serverUrl: val.httpUrl.trim(),
+            headers: val.headers || {},
+            original: item,
+          });
         }
       }
       return acc;
@@ -4870,7 +5749,11 @@ var MCPApp = class MCPApp {
       };
 
       const requestsInit = validServers.map((n) =>
-        this.createRequest_({ u: n.serverUrl, obj: JSON.stringify(payloadInit), customHeaders: n.headers }),
+        this.createRequest_({
+          u: n.serverUrl,
+          obj: JSON.stringify(payloadInit),
+          customHeaders: n.headers,
+        }),
       );
 
       this.mcpServerObj = this.fetch_(requestsInit).reduce(
@@ -4937,7 +5820,11 @@ var MCPApp = class MCPApp {
             ? acc.notifiedReqs
             : acc.canceledReqs;
           configTarget.push(
-            this.createRequest_({ u: serverObj.serverUrl, obj: payloadStr, customHeaders: serverObj.headers }),
+            this.createRequest_({
+              u: serverObj.serverUrl,
+              obj: payloadStr,
+              customHeaders: serverObj.headers,
+            }),
           );
           return acc;
         },
@@ -5152,10 +6039,10 @@ var MCPApp = class MCPApp {
 /**
  * MCPA2Aserver: Class Object for Consolidating Generative AI Protocols
  * Author: Tanaike
- * v2.1.0 (History-Aware Update)
+ * v2.2.1 (Global Scope Reference Bug Fix for ToolsForMCPServer Integration)
  * GitHub: https://github.com/tanaikech/MCPA2Aserver-GAS-Library
  *
- * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking, 
+ * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking,
  * and Seamless Server-Side Chat History Injection for A2A Protocols.
  *
  * ### Description
@@ -5171,8 +6058,8 @@ var MCPApp = class MCPApp {
  * mcpA2A.setServices({ lock: LockService.getScriptLock() });
  * ```
  *
- * #### 2. Configuration & History Injection (New)
- * Configure your server credentials. You can now inject a "Base History" (e.g., System Persona or absolute facts) 
+ * #### 2. Configuration & History Injection
+ * Configure your server credentials. You can now inject a "Base History" (e.g., System Persona or absolute facts)
  * that the remote A2A server will always prepend to the incoming client history.
  * ```javascript
  * mcpA2A.apiKey = "YOUR_GEMINI_API_KEY";
@@ -5295,7 +6182,9 @@ var MCPA2Aserver = class MCPA2Aserver {
    */
   setHistory(history) {
     if (!Array.isArray(history)) {
-      throw new Error("CRITICAL: History must be an array of objects compatible with GeminiWithFiles.");
+      throw new Error(
+        "CRITICAL: History must be an array of objects compatible with GeminiWithFiles.",
+      );
     }
     this.history = history;
     return this;
@@ -5311,6 +6200,76 @@ var MCPA2Aserver = class MCPA2Aserver {
   }
 
   /**
+   * Thread-safe helper to fetch or create a spreadsheet sheet with strict lock control.
+   * Prevents parallel-process insertion failures in high-volume environments.
+   *
+   * @private
+   * @param {GoogleAppsScript.Spreadsheet.Spreadsheet} ss - The targeted spreadsheet.
+   * @param {String} name - Name of the required sheet.
+   * @param {Array<String>} [headers] - Optional header array to inject if generating new.
+   * @return {GoogleAppsScript.Spreadsheet.Sheet}
+   */
+  _getOrCreateSheet(ss, name, headers) {
+    let sheet = ss.getSheetByName(name);
+    if (!sheet) {
+      const lock = LockService.getScriptLock();
+      let lockAcquired = false;
+      try {
+        lockAcquired = lock.tryLock(15000);
+        sheet = ss.getSheetByName(name); // Double check inside the lock boundary
+        if (!sheet) {
+          sheet = ss.insertSheet(name);
+          if (headers && headers.length > 0) {
+            sheet.appendRow(headers);
+            sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+          }
+        }
+      } catch (e) {
+        // Fallback gracefully in case of race condition or parallel writes
+        sheet = ss.getSheetByName(name) || ss.getSheets()[0];
+      } finally {
+        if (lockAcquired) {
+          lock.releaseLock();
+        }
+      }
+    }
+    return sheet;
+  }
+
+  /**
+   * Serializes a generic Apps Script Event Object safely, stripping read-only properties
+   * and cyclical references that trigger standard JSON.stringify errors.
+   *
+   * @private
+   * @param {EventObject} e - Event object received from doGet/doPost.
+   * @return {String} Serialized representation.
+   */
+  serializeEvent_(e) {
+    if (!e) return "null";
+    try {
+      const clone = {
+        queryString: e.queryString || "",
+        parameter: e.parameter || {},
+        parameters: e.parameters || {},
+        contextPath: e.contextPath || "",
+        contentLength: e.contentLength || -1,
+        pathInfo: e.pathInfo || "",
+        postData: e.postData
+          ? {
+              length: e.postData.length,
+              type: e.postData.type,
+              contents: e.postData.contents,
+              name: e.postData.name,
+            }
+          : null,
+      };
+      return JSON.stringify(clone);
+    } catch (err) {
+      return "Error serializing event: " + err.message;
+    }
+  }
+
+  /**
    * Main Dispatcher Method
    * Analyzes context, routes the request, and flushes execution logs to the specified Google Sheet.
    *
@@ -5323,6 +6282,44 @@ var MCPA2Aserver = class MCPA2Aserver {
     this.execId = Utilities.getUuid();
     this.logs = [];
     this.logCallback = callback;
+    let route = null; // Declared early to avoid reference issues in catch block
+
+    // Setup sheet requirements and log raw requests instantly to raw sheet
+    if (this.logSpreadsheetId) {
+      try {
+        const ss = SpreadsheetApp.openById(this.logSpreadsheetId);
+        this._getOrCreateSheet(ss, "raw", ["Timestamp", "Event Object"]);
+        this._getOrCreateSheet(ss, "MCP", [
+          "Date",
+          "Method",
+          "ID",
+          "Direction",
+          "Message",
+        ]);
+        this._getOrCreateSheet(ss, "A2A", [
+          "Date",
+          "Phase/Method",
+          "ID",
+          "Direction",
+          "Message",
+        ]);
+        this._getOrCreateSheet(ss, "MCPA2Aserver_log", [
+          "Timestamp",
+          "Execution ID",
+          "Direction",
+          "Level",
+          "Message",
+        ]);
+
+        const rawSheet = ss.getSheetByName("raw");
+        const serializedEvent = this.serializeEvent_(e);
+        rawSheet.appendRow([new Date().toISOString(), serializedEvent]);
+      } catch (err) {
+        console.error(
+          "Failed to initialize multi-channel logging: " + err.stack,
+        );
+      }
+    }
 
     this.addLog_("Main dispatcher initiated.", "INFO", "Internal");
 
@@ -5371,7 +6368,7 @@ var MCPA2Aserver = class MCPA2Aserver {
       }
 
       const processedServers = this.parseContext_(targetContext);
-      const route = this.determineRoute_(e);
+      route = this.determineRoute_(e);
       this.addLog_(`Route determined as: ${route.type}`, "INFO", "Internal");
 
       let targetEvent = e;
@@ -5382,27 +6379,53 @@ var MCPA2Aserver = class MCPA2Aserver {
         processedServers.processedA2AObj
       ) {
         // Safe History Injection for A2A payloads
-        if (this.history && this.history.length > 0 && e.postData && e.postData.contents) {
+        if (
+          this.history &&
+          this.history.length > 0 &&
+          e.postData &&
+          e.postData.contents
+        ) {
           try {
             const postObj = JSON.parse(e.postData.contents);
-            if (postObj.params && (postObj.method === "message/send" || postObj.method === "tasks/send")) {
-              postObj.params.history = [...this.history, ...(postObj.params.history || [])];
+            if (
+              postObj.params &&
+              (postObj.method === "message/send" ||
+                postObj.method === "tasks/send")
+            ) {
+              postObj.params.history = [
+                ...this.history,
+                ...(postObj.params.history || []),
+              ];
               targetEvent = this.cloneEvent_(e);
               targetEvent.postData.contents = JSON.stringify(postObj);
-              this.addLog_(`Injected ${this.history.length} base history elements into incoming A2A payload.`, "INFO", "Internal");
+              this.addLog_(
+                `Injected ${this.history.length} base history elements into incoming A2A payload.`,
+                "INFO",
+                "Internal",
+              );
             }
-          } catch(err) {
-            this.addLog_(`Failed to inject history into payload: ${err.message}`, "WARN", "Internal");
+          } catch (err) {
+            this.addLog_(
+              `Failed to inject history into payload: ${err.message}`,
+              "WARN",
+              "Internal",
+            );
           }
         }
-        response = this.handleA2ARequest_(targetEvent, processedServers.processedA2AObj);
+        response = this.handleA2ARequest_(
+          targetEvent,
+          processedServers.processedA2AObj,
+        );
       } else if (
         route.type === "MCP" &&
         this.mcp === true &&
         processedServers.processedMCPObj
       ) {
         // MCP protocol is purely functional and operates without chat history context.
-        response = this.handleMCPRequest_(targetEvent, processedServers.processedMCPObj);
+        response = this.handleMCPRequest_(
+          targetEvent,
+          processedServers.processedMCPObj,
+        );
       } else {
         this.addLog_(
           `Unhandled routing or disabled server. Route Type: ${route.type}, A2A Enabled: ${this.a2a}, MCP Enabled: ${this.mcp}`,
@@ -5414,9 +6437,14 @@ var MCPA2Aserver = class MCPA2Aserver {
         );
       }
     } catch (err) {
-      this.addLog_(`Execution Error: ${err.message}`, "ERROR", "Internal");
+      const processTag = route ? `[${route.type}]` : "[Routing]";
+      this.addLog_(
+        `Execution Error ${processTag}: ${err.message}`,
+        "ERROR",
+        "Internal",
+      );
       response = ContentService.createTextOutput(
-        JSON.stringify({ error: err.message }),
+        JSON.stringify({ error: `[MCPA2Aserver Error] ${err.message}` }),
       ).setMimeType(ContentService.MimeType.JSON);
     }
 
@@ -5454,12 +6482,14 @@ var MCPA2Aserver = class MCPA2Aserver {
       contextPath: e.contextPath,
       contentLength: e.contentLength,
       pathInfo: e.pathInfo,
-      postData: e.postData ? {
-        length: e.postData.length,
-        type: e.postData.type,
-        contents: e.postData.contents,
-        name: e.postData.name
-      } : null
+      postData: e.postData
+        ? {
+            length: e.postData.length,
+            type: e.postData.type,
+            contents: e.postData.contents,
+            name: e.postData.name,
+          }
+        : null,
     };
   }
 
@@ -5533,12 +6563,6 @@ var MCPA2Aserver = class MCPA2Aserver {
 
       const ss = SpreadsheetApp.openById(this.logSpreadsheetId);
       const sheetName = "MCPA2Aserver_log";
-      let sheet = ss.getSheetByName(sheetName);
-
-      if (!sheet) {
-        sheet = ss.insertSheet(sheetName);
-      }
-
       const headers = [
         "Timestamp",
         "Execution ID",
@@ -5546,21 +6570,7 @@ var MCPA2Aserver = class MCPA2Aserver {
         "Level",
         "Message",
       ];
-      const lastRow = sheet.getLastRow();
-
-      if (lastRow === 0) {
-        sheet.appendRow(headers);
-        sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
-      } else {
-        const firstCell = sheet.getRange(1, 1).getValue();
-        if (firstCell !== headers[0]) {
-          sheet.insertRowBefore(1);
-          sheet
-            .getRange(1, 1, 1, headers.length)
-            .setValues([headers])
-            .setFontWeight("bold");
-        }
-      }
+      const sheet = this._getOrCreateSheet(ss, sheetName, headers);
 
       const data = this.logs.map((log) => [
         log.timestamp,
@@ -5720,7 +6730,11 @@ var MCPA2Aserver = class MCPA2Aserver {
           { params_: {} },
         );
 
-      agentCard_ToolsForMCPServer.url = this.webAppsUrl;
+      // This dynamically binds the runtime resolved Web App URL to the local context object.
+      const agentCard = {
+        ...agentCard_ToolsForMCPServer,
+        url: this.webAppsUrl,
+      };
       this.addLog_(
         "ToolsForMCPServer context generated successfully.",
         "INFO",
@@ -5729,7 +6743,7 @@ var MCPA2Aserver = class MCPA2Aserver {
 
       return {
         functions: functions,
-        agentCard: agentCard_ToolsForMCPServer,
+        agentCard: agentCard,
       };
     } catch (err) {
       this.addLog_(
@@ -5804,9 +6818,13 @@ var MCPA2Aserver = class MCPA2Aserver {
       this.addLog_("A2A Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
-      this.addLog_(`A2A Handle Error: ${err.stack}`, "ERROR", "Internal");
+      this.addLog_(
+        `[A2A Server Process Error] A2A Handle Error: ${err.stack}`,
+        "ERROR",
+        "Internal",
+      );
       return ContentService.createTextOutput(
-        JSON.stringify({ error: err.message }),
+        JSON.stringify({ error: `[A2A Server Error] ${err.message}` }),
       ).setMimeType(ContentService.MimeType.JSON);
     }
   }
@@ -5833,9 +6851,13 @@ var MCPA2Aserver = class MCPA2Aserver {
       this.addLog_("MCP Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
-      this.addLog_(`MCP Handle Error: ${err.stack}`, "ERROR", "Internal");
+      this.addLog_(
+        `[MCP Server Process Error] MCP Handle Error: ${err.stack}`,
+        "ERROR",
+        "Internal",
+      );
       return ContentService.createTextOutput(
-        JSON.stringify({ error: err.message }),
+        JSON.stringify({ error: `[MCP Server Error] ${err.message}` }),
       ).setMimeType(ContentService.MimeType.JSON);
     }
   }

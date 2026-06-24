@@ -3,7 +3,55 @@
  *
  * @description
  * Executes a comprehensive and integrated test suite for the LlmAgent.
- * Verifies explicit routing capabilities and anti-redundancy rules.
+ * Verifies explicit routing capabilities, anti-redundancy rules, and Hook system integration.
+ */
+
+// ==========================================
+// COMPREHENSIVE DUMMY HOOKS (Exposed Globally)
+// ==========================================
+
+/**
+ * Global hook function for BeforeAgent in Comprehensive tests.
+ *
+ * @param {Object} input - HookInput
+ * @returns {Object} HookResult
+ */
+function compHookBeforeAgent(input) {
+  console.log(`[Comprehensive Hook: BeforeAgent] Intercepted prompt: '${input.prompt}'`);
+  return { additionalContext: "Injected Directive: Prioritize using tools in the sequence requested." };
+}
+
+/**
+ * Global hook function for BeforeTool in Comprehensive tests.
+ *
+ * @param {Object} input - HookInput
+ * @returns {Object} HookResult
+ */
+function compHookBeforeTool(input) {
+  console.log(`[Comprehensive Hook: BeforeTool] Checking tool: '${input.toolName}'`);
+  if (input.prompt && input.prompt.includes("forbidden_node")) {
+    console.log(`[Comprehensive Hook: BeforeTool] Denying execution for prompt containing forbidden_node`);
+    return { decision: "deny", reason: "Access to forbidden_node is prohibited by security hook." };
+  }
+  return { decision: "allow" };
+}
+
+/**
+ * Global hook function for AfterTool in Comprehensive tests.
+ *
+ * @param {Object} input - HookInput
+ * @returns {Object} HookResult
+ */
+function compHookAfterTool(input) {
+  console.log(`[Comprehensive Hook: AfterTool] Intercepted tool result for: '${input.toolName}'`);
+  if (input.result && input.result.includes("operational")) {
+    return { result: input.result + " (Security Verified by Hook)" };
+  }
+  return { result: input.result };
+}
+
+/**
+ * Entry point to execute the comprehensive test suite.
  */
 function executeComprehensiveTestSuite() {
   const { LlmAgent } = GASADK;
@@ -54,6 +102,7 @@ function executeComprehensiveTestSuite() {
     }).setServices({
       lock: LockService.getScriptLock(),
       properties: properties,
+      globalContext: this
     });
 
     const mcpServers =
@@ -96,12 +145,37 @@ function executeComprehensiveTestSuite() {
       skillFolderId: skillFolderId,
       codeExecutor: {},
       googleSearch: {},
+      hooks: {
+        "BeforeAgent": [
+          {
+            "matcher": "*",
+            "hooks": [
+              { "type": "gas_function", "functionName": "compHookBeforeAgent" }
+            ]
+          }
+        ],
+        "BeforeTool": [
+          {
+            "matcher": "*",
+            "type": "gas_function",
+            "functionName": "compHookBeforeTool"
+          }
+        ],
+        "AfterTool": [
+          {
+            "matcher": "get_server_status",
+            "type": "gas_function",
+            "functionName": "compHookAfterTool"
+          }
+        ]
+      }
     }).setServices({
       lock: LockService.getScriptLock(),
       properties: properties,
+      globalContext: this
     });
 
-    // Prompts modernized to test explicit capability routing
+    // Prompts modernized to test explicit capability routing and hook systems
     const prompts = [
       {
         target: "Native Tool",
@@ -122,6 +196,14 @@ function executeComprehensiveTestSuite() {
       {
         target: "Google Search",
         text: "Use GoogleSearch to find who won the Nobel Prize in Physics in 2023.",
+      },
+      {
+        target: "Hooks & Native Tool (Compound)",
+        text: "Use the Native Tool to execute 'get_server_status' for node 'Beta-2'. Confirm the result contains the hook security verified suffix.",
+      },
+      {
+        target: "Hooks Blocking (Compound)",
+        text: "Use the Native Tool to execute 'get_server_status' for node 'forbidden_node'. Validate if access is blocked by security.",
       },
     ];
 
