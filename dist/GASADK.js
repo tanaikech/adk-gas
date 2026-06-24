@@ -537,7 +537,7 @@ var LlmAgent = class LlmAgent {
 
     this.name = config.name || "Agent";
     this.description = config.description || "";
-    this.model = config.model || "models/gemini-3-flash-preview";
+    this.model = config.model || "models/gemini-3.1-flash-lite";
     this.instruction = config.instruction || "";
     this.state = config.state || {};
 
@@ -2151,7 +2151,7 @@ Objective:
 /**
  * GeminiWithFiles
  * Author: Kanshi Tanaike
- * Version: 2.0.30
+ * Version: 2.1.0
  * GitHub: https://github.com/tanaikech/GeminiWithFiles
  * @class
  */
@@ -2423,7 +2423,7 @@ var GeminiWithFiles = class GeminiWithFiles {
     return results;
   }
 
-  generateContent(object, retry) {
+  generateContentInternal(object, retry) {
     if (!object || typeof object !== "object")
       throw new Error("Please set object including question.");
     if (retry === undefined) retry = this.skillFolderId ? 15 : 5;
@@ -2986,11 +2986,63 @@ var GeminiWithFiles = class GeminiWithFiles {
     return params ? `${url}?${params}` : url;
   }
 
+  setHookManager(hookManager) {
+    this.hookManager = hookManager;
+    return this;
+  }
+
+  generateContent(object, retry) {
+    if (this.hookManager) {
+      const beforeResult = this.hookManager.execute("BeforeModel", {
+        config: this,
+        query: (object && object.q) || "",
+        history: this.history || [],
+        model: this.model
+      });
+
+      if (beforeResult.decision === "deny") {
+        throw new Error("Model request blocked by GeminiWithFiles BeforeModel hook.");
+      }
+
+      if (beforeResult.query && object) {
+        object.q = beforeResult.query;
+      }
+
+      const mockedResponse = beforeResult.hookSpecificOutput?.llm_response || beforeResult.llm_response;
+      if (mockedResponse && mockedResponse.text !== undefined) {
+        return { returnValue: mockedResponse.text, totalTokenCount: 0 };
+      }
+    }
+
+    const rawRes = this.generateContentInternal(object, retry);
+
+    if (this.hookManager) {
+      const textVal = typeof rawRes === 'string' ? rawRes : (rawRes.returnValue || "");
+      const afterResult = this.hookManager.execute("AfterModel", {
+        text: textVal,
+        response: rawRes,
+        model: this.model
+      });
+
+      if (afterResult.decision === "deny") {
+        throw new Error("Model response blocked and discarded by AfterModel hook.");
+      }
+
+      const modifiedResponse = afterResult.hookSpecificOutput?.llm_response || afterResult.llm_response;
+      if (modifiedResponse && modifiedResponse.text !== undefined) {
+        return { returnValue: modifiedResponse.text, totalTokenCount: rawRes.totalTokenCount || 0 };
+      }
+    }
+
+    return rawRes;
+  }
+
   fetch_(obj, checkError = true) {
     obj.muteHttpExceptions = true;
     const res = UrlFetchApp.fetchAll([obj])[0];
-    if (checkError && res.getResponseCode() !== 200)
+    if (checkError && res.getResponseCode() !== 200) {
       throw new Error(res.getContentText());
+    }
     return res;
   }
 };
@@ -3021,7 +3073,7 @@ const toLog_ = (kind, text) => {
  *   { "secure-agent": { "httpUrl": "https://secure.agent.com", "headers": { "X-Agent-Key": "my-secret" } } }
  * ];
  *
- * const app = new A2AApp({ model: "models/gemini-3-flash-preview" });
+ * const app = new A2AApp({ model: "models/gemini-3.1-flash-lite" });
  * app.setServices({ lock: LockService.getScriptLock() });
  *
  * // --- Chat History Example ---
@@ -3053,7 +3105,7 @@ const toLog_ = (kind, text) => {
  *
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.8.0 (Direct JSON-RPC Bypass Optimization & Dynamic Logging Routing)
+ * Version: 2.9.0 (Hooks System & Modern Model Update)
  * GitHub: https://github.com/tanaikech/A2AApp
  * @class
  */
@@ -3063,7 +3115,7 @@ var A2AApp = class A2AApp {
    * @param {String} [object.accessKey] Access key for A2A server (optional).
    * @param {Boolean} [object.log] Enable logging to Google Sheets (default: false).
    * @param {String} [object.spreadsheetId] Spreadsheet ID for logs.
-   * @param {String} [object.model] Model name (default: "models/gemini-3-flash-preview").
+   * @param {String} [object.model] Model name (default: "models/gemini-3.1-flash-lite").
    */
   constructor(object = {}) {
     const { accessKey = null, log = false, spreadsheetId, model } = object;
@@ -3072,7 +3124,7 @@ var A2AApp = class A2AApp {
     this.accessKey = accessKey;
 
     /** @private */
-    this.model = model || "models/gemini-3-flash-preview";
+    this.model = model || "models/gemini-3.1-flash-lite";
 
     /** @private */
     this.jsonrpc = "2.0";
@@ -3716,7 +3768,7 @@ var A2AApp = class A2AApp {
    * Discards the massive overhead of Phase 3 to 7 LLM proxy emulation logic.
    * @private
    */
-  dispatchDirectRPC_(object) {
+  dispatchDirectRPCInternal_(object) {
     const { apiKey, prompt, agentCards, history = [] } = object;
     const targetAgent = agentCards[0];
 
@@ -4294,6 +4346,7 @@ var A2AApp = class A2AApp {
       responseMimeType: "application/json",
       responseSchema,
     });
+    if (this.hookManager) g.setHookManager(this.hookManager);
     g.history = [...history, ...(g.history || [])];
 
     const textPrompt = `User's prompt is as follows.\n<UserPrompt>${prompt}</UserPrompt>`;
@@ -4366,6 +4419,7 @@ var A2AApp = class A2AApp {
           functionCallingConfig: { mode: "any", allowedFunctionNames: [name] },
         },
       });
+      if (this.hookManager) gg.setHookManager(this.hookManager);
 
       const q = [
         `Your task is as follows.`,
@@ -4617,6 +4671,7 @@ var A2AApp = class A2AApp {
           model: this.model,
           history: tempHistory,
         });
+        if (this.hookManager) gg.setHookManager(this.hookManager);
         const res3 = gg.generateContent({
           parts: [
             { text: `Summarize answers by considering the question.` },
@@ -4733,6 +4788,42 @@ var A2AApp = class A2AApp {
       ? `${url}&${queryString}`
       : `${url}?${queryString}`;
   }
+
+  setHookManager(hookManager) {
+    this.hookManager = hookManager;
+    return this;
+  }
+
+  dispatchDirectRPC_(object) {
+    if (this.hookManager) {
+      const beforeToolRes = this.hookManager.execute("BeforeTool", {
+        toolName: (object && object.method) || "remote_call",
+        arguments: (object && object.params) || {},
+        source: "a2a_client"
+      });
+
+      if (beforeToolRes.decision === "deny") {
+        return {
+          result: `[Hook Blocked] Tool execution denied by BeforeTool hook. Reason: ${beforeToolRes.reason || "Unspecified"}`
+        };
+      }
+    }
+
+    let res = this.dispatchDirectRPCInternal_(object);
+
+    if (this.hookManager) {
+      const afterToolRes = this.hookManager.execute("AfterTool", {
+        toolName: (object && object.method) || "remote_call",
+        result: (res && res.result) || res,
+        source: "a2a_client"
+      });
+      if (afterToolRes.result !== undefined) {
+        res = { result: afterToolRes.result };
+      }
+    }
+
+    return res;
+  }
 };
 
 
@@ -4740,7 +4831,7 @@ var A2AApp = class A2AApp {
  * Class object for MCP (Model Context Protocol).
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.3.0 (Multi-Channel Sheet Logging Update)
+ * Version: 2.4.0 (Hooks System & Modern Model Update)
  * Date: 2026-06-10
  * GitHub: https://github.com/tanaikech/MCPApp
  * @class
@@ -4760,7 +4851,11 @@ var MCPApp = class MCPApp {
       log = false,
       spreadsheetId = null,
       lock = true,
+      model,
     } = object;
+
+    /** @private */
+    this.model = model || "models/gemini-3.1-flash-lite";
 
     /** @private */
     this.accessKey = accessKey;
@@ -5381,9 +5476,9 @@ var MCPApp = class MCPApp {
     }
 
     this.clientInfo = { name: "MCPApp_client", version: "1.0.0" };
-
+ 
     /** @private */
-    this.model = "models/gemini-3-flash-preview";
+    this.model = object.model || this.model || "models/gemini-3.1-flash-lite";
 
     /** @private */
     this.id = 0;
@@ -6057,6 +6152,22 @@ var MCPApp = class MCPApp {
                 parameters: inputSchema,
               };
               executionCallback = (params) => {
+                if (this.hookManager) {
+                  const beforeRes = this.hookManager.execute("BeforeTool", {
+                    toolName: cleanName,
+                    arguments: params,
+                    source: "mcp_server"
+                  });
+                  if (beforeRes.decision === "deny") {
+                    throw new Error(`[Hook Blocked] Server tool '${cleanName}' execution denied by BeforeTool hook. Reason: ${beforeRes.reason || "Unspecified"}`);
+                  }
+                  if (beforeRes.tool_input?.execution_prompt !== undefined) {
+                    params = beforeRes.tool_input.execution_prompt;
+                  } else if (beforeRes.arguments !== undefined) {
+                    params = beforeRes.arguments;
+                  }
+                }
+
                 console.log(`--- Activating Tool Service: ${cleanName}`);
                 const dispatchPayload = {
                   method: routingMap[endpointKey],
@@ -6064,11 +6175,24 @@ var MCPApp = class MCPApp {
                   jsonrpc: this.jsonrpc,
                   id: this.id++,
                 };
-                return fetchWrapper({
+                let result = fetchWrapper({
                   payload: dispatchPayload,
                   serverUrl,
                   customHeaders: headers,
                 });
+
+                if (this.hookManager) {
+                  const afterRes = this.hookManager.execute("AfterTool", {
+                    toolName: cleanName,
+                    result: result,
+                    source: "mcp_server"
+                  });
+                  if (afterRes.result !== undefined) {
+                    result = afterRes.result;
+                  }
+                }
+
+                return result;
               };
             }
 
@@ -6476,13 +6600,18 @@ var MCPApp = class MCPApp {
       )
       .setValues(sanitizedData);
   }
+
+  setHookManager(hookManager) {
+    this.hookManager = hookManager;
+    return this;
+  }
 };
 
 
 /**
  * MCPA2Aserver: Class Object for Consolidating Generative AI Protocols
  * Author: Tanaike
- * v2.2.1 (Global Scope Reference Bug Fix for ToolsForMCPServer Integration)
+ * v2.3.0 (Hooks System & Modern Model Update)
  * GitHub: https://github.com/tanaikech/MCPA2Aserver-GAS-Library
  *
  * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking,
@@ -6506,7 +6635,7 @@ var MCPApp = class MCPApp {
  * that the remote A2A server will always prepend to the incoming client history.
  * ```javascript
  * mcpA2A.apiKey = "YOUR_GEMINI_API_KEY";
- * mcpA2A.model = "models/gemini-3-flash-preview";
+ * mcpA2A.model = "models/gemini-3.1-flash-lite";
  * mcpA2A.setHistory([
  *   { role: "user", parts: [{ text: "System Context: You are a financial expert." }] },
  *   { role: "model", parts: [{ text: "Understood. I will act as a financial expert." }] }
@@ -6533,7 +6662,7 @@ var MCPApp = class MCPApp {
  * const response = mcpA2A.main(e, context, logCallback);
  * return response;
  * ```
- */
+ * */
 var MCPA2Aserver = class MCPA2Aserver {
   /**
    * Initializes the MCPA2Aserver properties.
@@ -6543,7 +6672,7 @@ var MCPA2Aserver = class MCPA2Aserver {
     this.apiKey = "";
 
     /** @type {String} Model version to be used for generative AI. */
-    this.model = "models/gemini-3-flash-preview";
+    this.model = "models/gemini-3.1-flash-lite";
 
     /** @type {String} Access key to restrict access to the Web Apps. */
     this.accessKey = "";
@@ -7257,7 +7386,9 @@ var MCPA2Aserver = class MCPA2Aserver {
         o.log = true;
         o.spreadsheetId = this.logSpreadsheetId;
       }
-      const res = new A2AApp(o).setServices({ lock: this.lock }).server(object);
+      const appInstance = new A2AApp(o).setServices({ lock: this.lock });
+      if (this.hookManager) appInstance.setHookManager(this.hookManager);
+      const res = appInstance.server(object);
       this.addLog_("A2A Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
@@ -7290,7 +7421,9 @@ var MCPA2Aserver = class MCPA2Aserver {
         o.log = true;
         o.spreadsheetId = this.logSpreadsheetId;
       }
-      const res = new MCPApp(o).setServices({ lock: this.lock }).server(object);
+      const appInstance = new MCPApp(o).setServices({ lock: this.lock });
+      if (this.hookManager) appInstance.setHookManager(this.hookManager);
+      const res = appInstance.server(object);
       this.addLog_("MCP Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
@@ -7303,6 +7436,17 @@ var MCPA2Aserver = class MCPA2Aserver {
         JSON.stringify({ error: `[MCP Server Error] ${err.message}` }),
       ).setMimeType(ContentService.MimeType.JSON);
     }
+  }
+
+  /**
+   * Sets the hook manager for integrating hooks system.
+   *
+   * @param {GasHookManager} hookManager - Hook manager instance.
+   * @returns {MCPA2Aserver} This instance for chaining.
+   */
+  setHookManager(hookManager) {
+    this.hookManager = hookManager;
+    return this;
   }
 };
 
@@ -7327,35 +7471,35 @@ var MCPA2Aserver = class MCPA2Aserver {
  * @param {object} [options.config] - The configuration object specific to the method being called.
  * @returns {any} The result from the called method.
  */
-function fileSearchEntryPoint(options = {}) {
-  const { method, config = {}, ...constructorOptions } = options;
-  if (!method) {
-    throw new Error("A 'method' property must be specified in the options.");
-  }
+// function fileSearchEntryPoint(options = {}) {
+//   const { method, config = {}, ...constructorOptions } = options;
+//   if (!method) {
+//     throw new Error("A 'method' property must be specified in the options.");
+//   }
 
-  const fileSearch = new FileSearch(constructorOptions);
+//   const fileSearch = new FileSearch(constructorOptions);
 
-  if (typeof fileSearch[method] !== "function") {
-    throw new Error(
-      `Method '${method}' does not exist on the FileSearch class.`
-    );
-  }
+//   if (typeof fileSearch[method] !== "function") {
+//     throw new Error(
+//       `Method '${method}' does not exist on the FileSearch class.`
+//     );
+//   }
 
-  return fileSearch[method](config);
-}
+//   return fileSearch[method](config);
+// }
 
 /**
  * A class for interacting with the Google AI File Search API.
  */
-class FileSearch {
+var FileSearch = class FileSearch {
   /**
    * @param {object} params - The parameters.
    * @param {string} params.apiKey - The Gemini API key.
-   * @param {string} [params.model="models/gemini-2.5-flash"] - The Gemini model name.
+   * @param {string} [params.model="models/gemini-3.1-flash-lite"] - The Gemini model name.
    */
   constructor({
     apiKey,
-    model = "models/gemini-2.5-flash" /** or models/gemini-2.5-pro */,
+    model = "models/gemini-3.1-flash-lite" /** or models/gemini-2.5-pro */,
   }) {
     if (!apiKey) {
       throw new Error("API key is required.");
@@ -7645,7 +7789,7 @@ class FileSearch {
       if (!supportedMimeTypes.includes(fileBlob.getContentType())) {
         return UrlFetchApp.fetch(
           `https://drive.google.com/thumbnail?sz=w1000&id=${fileId}`,
-          { headers: { authorization: "Bearer " + ScriptApp.getOAuthToken() } }
+          { headers: { authorization: "Bearer " + ScriptApp.getOAuthToken() } },
         ).getBlob();
       }
       return fileBlob;
@@ -7659,7 +7803,7 @@ class FileSearch {
         fileBlob = Utilities.newBlob(
           text,
           mimeType || MimeType.PLAIN_TEXT,
-          displayName || `doc-${Date.now()}`
+          displayName || `doc-${Date.now()}`,
         );
       } else if (url) {
         fileBlob = UrlFetchApp.fetch(url).getBlob();
@@ -7678,7 +7822,7 @@ class FileSearch {
       const payload = {
         metadata: Utilities.newBlob(
           JSON.stringify(metadata),
-          "application/json"
+          "application/json",
         ),
         file: convMimeType_(fileBlob),
       };
@@ -7687,7 +7831,7 @@ class FileSearch {
         endpoint,
         { method: "post", payload },
         {},
-        true
+        true,
       );
       const finalOperation = this._pollOperation(operation);
       return `Processing complete for: ${metadata.displayName}\nDocument name is "${finalOperation.name}".`;
@@ -7803,7 +7947,7 @@ class FileSearch {
   documents_query({ name, query, resultsCount, metadataFilters = [] }) {
     if (!name || !query) {
       throw new Error(
-        "Provide both 'name' (the document resource name) and 'query'."
+        "Provide both 'name' (the document resource name) and 'query'.",
       );
     }
     const endpoint = `/${name}:query`;
@@ -7905,4 +8049,4 @@ class FileSearch {
       throw new Error(`API Error: ${responseCode} - ${responseBody}`);
     }
   }
-}
+};

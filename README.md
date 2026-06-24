@@ -221,7 +221,7 @@ The `new LlmAgent(config)` constructor accepts an extensive configuration object
 | `apiKey`                 | String        | **Yes**  | Your Gemini API Key.                                                                                                 |
 | `name`                   | String        |    No    | Internal name of the agent. Defaults to `"Agent"`.                                                                   |
 | `description`            | String        |    No    | Agent description. Critical for parent orchestrators utilizing Sub-Agents.                                           |
-| `model`                  | String        |    No    | The Gemini model. Defaults to `"models/gemini-3-flash-preview"`.                                                     |
+| `model`                  | String        |    No    | The Gemini model. Defaults to `"models/gemini-3.1-flash-lite"`.                                                     |
 | `instruction`            | String/Object |    No    | Global system instruction. Supports `{var_name}` interpolation.                                                      |
 | `state`                  | Object        |    No    | Key-value mapping for dynamic state variables. Replaces `{var_name}`.                                                |
 | `tools`                  | Array         |    No    | Array of native GAS functions mapped to the tool schema.                                                             |
@@ -353,7 +353,7 @@ function test_quickstart() {
   const agent = new LlmAgent({
     apiKey: API_KEY,
     name: "HelperAgent",
-    model: "models/gemini-3-flash-preview",
+    model: "models/gemini-3.1-flash-lite",
     instruction: "You are a helpful AI assistant.",
   });
 
@@ -538,7 +538,7 @@ const WEB_APPS_URL =
 
 const object = {
   apiKey: API_KEY,
-  model: "models/gemini-3-flash-preview",
+  model: "models/gemini-3.1-flash-lite",
   accessKey: "sample",
 };
 
@@ -668,7 +668,7 @@ function test_chat_history() {
   const agent = new LlmAgent({
     apiKey: API_KEY,
     name: "ChattyAgent",
-    model: "models/gemini-3-flash-preview",
+    model: "models/gemini-3.1-flash-lite",
   }).setServices({ lock: LockService.getScriptLock(), properties: properties });
 
   // 1. Manually seed/restore conversation history
@@ -957,5 +957,8 @@ const agent = new LlmAgent({
   - Added API Quota Safeguard: Track model token consumption per session and enforce session-level token usage limit check via `maxTokensPerSession` configuration.
   - Added Hook & Session Propagation: Automatically propagate parent hooks security context (`hookManager` and `sessionId`) and token constraints down to child sub-agents during hierarchical delegation.
   - Added Human-in-the-Loop (HITL) Integration: Supported `decision: "suspend"` decisions in BeforeTool hooks. Seamlessly serializes and stores task state to `PropertiesService` (under `HITL_STATE_[sessionId]`) and throws a `"SUSPENDED"` exception. Added `saveState()`, `loadState(sessionId)`, and `resume(sessionId, decision, approvedArgs)` methods to recover and run suspended agent execution loops.
+  - **Synchronized `src/lib/` Core Libraries**: Upgraded bundled core components (`GeminiWithFiles.js`, `A2AApp.js`, `MCPApp.js`, `MCPA2Aserver.js`, and `FileSearchApp.js`) to support the `GasHookManager` hooks system natively (allowing interceptors like `BeforeModel`, `AfterModel`, `BeforeTool`, and `AfterTool`).
+  - **Ecosystem Modernization**: Upgraded default model configurations to `models/gemini-3.1-flash-lite` across all workspace libraries, tests, and examples to provide modern, cost-effective defaults.
+  - **Modular Standalone Twin Synchronization**: Propagated and fully published these updates to all five standalone local repositories (`GeminiWithFiles_GAS_lib`, `A2AApp_GAS_lib`, `MCPApp_GAS_lib`, `MCPA2Aserver_GAS_lib`, `FileSearchApp_GAS_lib`) with next-version tags.
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)

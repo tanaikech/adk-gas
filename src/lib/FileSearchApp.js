@@ -42,11 +42,11 @@ var FileSearch = class FileSearch {
   /**
    * @param {object} params - The parameters.
    * @param {string} params.apiKey - The Gemini API key.
-   * @param {string} [params.model="models/gemini-2.5-flash"] - The Gemini model name.
+   * @param {string} [params.model="models/gemini-3.1-flash-lite"] - The Gemini model name.
    */
   constructor({
     apiKey,
-    model = "models/gemini-2.5-flash" /** or models/gemini-2.5-pro */,
+    model = "models/gemini-3.1-flash-lite" /** or models/gemini-2.5-pro */,
   }) {
     if (!apiKey) {
       throw new Error("API key is required.");

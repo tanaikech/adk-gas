@@ -23,7 +23,7 @@
  */
 
 function executeModularTestSuite() {
-  const { LlmAgent } = GASADK;
+  const LlmAgent = (typeof GASADK !== 'undefined') ? GASADK.LlmAgent : (typeof LlmAgent !== 'undefined' ? LlmAgent : null);
 
   const properties = PropertiesService.getScriptProperties();
   const API_KEY = properties.getProperty("GEMINI_API_KEY");
@@ -34,7 +34,7 @@ function executeModularTestSuite() {
   const A2A_SERVER_URL =
     properties.getProperty("A2A_SERVER_URL") || "YOUR_A2A_SERVER_URL";
 
-  const MODEL_NAME = "models/gemini-3-flash-preview";
+  const MODEL_NAME = "models/gemini-3.1-flash-lite";
 
   if (!API_KEY) {
     throw new Error(

@@ -54,11 +54,11 @@ function compHookAfterTool(input) {
  * Entry point to execute the comprehensive test suite.
  */
 function executeComprehensiveTestSuite() {
-  const { LlmAgent } = GASADK;
+  const LlmAgent = (typeof GASADK !== 'undefined') ? GASADK.LlmAgent : (typeof LlmAgent !== 'undefined' ? LlmAgent : null);
 
   const MCP_SERVER_URL = "YOUR_MCP_SERVER_URL";
   const A2A_SERVER_URL = "YOUR_A2A_SERVER_URL";
-  const MODEL_NAME = "models/gemini-3-flash-preview";
+  const MODEL_NAME = "models/gemini-3.1-flash-lite";
 
   const properties = PropertiesService.getScriptProperties();
   const API_KEY = properties.getProperty("GEMINI_API_KEY");

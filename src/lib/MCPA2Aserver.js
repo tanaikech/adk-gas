@@ -1,7 +1,7 @@
 /**
  * MCPA2Aserver: Class Object for Consolidating Generative AI Protocols
  * Author: Tanaike
- * v2.2.1 (Global Scope Reference Bug Fix for ToolsForMCPServer Integration)
+ * v2.3.0 (Hooks System & Modern Model Update)
  * GitHub: https://github.com/tanaikech/MCPA2Aserver-GAS-Library
  *
  * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking,
@@ -25,7 +25,7 @@
  * that the remote A2A server will always prepend to the incoming client history.
  * ```javascript
  * mcpA2A.apiKey = "YOUR_GEMINI_API_KEY";
- * mcpA2A.model = "models/gemini-3-flash-preview";
+ * mcpA2A.model = "models/gemini-3.1-flash-lite";
  * mcpA2A.setHistory([
  *   { role: "user", parts: [{ text: "System Context: You are a financial expert." }] },
  *   { role: "model", parts: [{ text: "Understood. I will act as a financial expert." }] }
@@ -52,7 +52,7 @@
  * const response = mcpA2A.main(e, context, logCallback);
  * return response;
  * ```
- */
+ * */
 var MCPA2Aserver = class MCPA2Aserver {
   /**
    * Initializes the MCPA2Aserver properties.
@@ -62,7 +62,7 @@ var MCPA2Aserver = class MCPA2Aserver {
     this.apiKey = "";
 
     /** @type {String} Model version to be used for generative AI. */
-    this.model = "models/gemini-3-flash-preview";
+    this.model = "models/gemini-3.1-flash-lite";
 
     /** @type {String} Access key to restrict access to the Web Apps. */
     this.accessKey = "";
@@ -776,7 +776,9 @@ var MCPA2Aserver = class MCPA2Aserver {
         o.log = true;
         o.spreadsheetId = this.logSpreadsheetId;
       }
-      const res = new A2AApp(o).setServices({ lock: this.lock }).server(object);
+      const appInstance = new A2AApp(o).setServices({ lock: this.lock });
+      if (this.hookManager) appInstance.setHookManager(this.hookManager);
+      const res = appInstance.server(object);
       this.addLog_("A2A Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
@@ -809,7 +811,9 @@ var MCPA2Aserver = class MCPA2Aserver {
         o.log = true;
         o.spreadsheetId = this.logSpreadsheetId;
       }
-      const res = new MCPApp(o).setServices({ lock: this.lock }).server(object);
+      const appInstance = new MCPApp(o).setServices({ lock: this.lock });
+      if (this.hookManager) appInstance.setHookManager(this.hookManager);
+      const res = appInstance.server(object);
       this.addLog_("MCP Request handled successfully.", "INFO", "Internal");
       return res;
     } catch (err) {
@@ -823,4 +827,16 @@ var MCPA2Aserver = class MCPA2Aserver {
       ).setMimeType(ContentService.MimeType.JSON);
     }
   }
+
+  /**
+   * Sets the hook manager for integrating hooks system.
+   *
+   * @param {GasHookManager} hookManager - Hook manager instance.
+   * @returns {MCPA2Aserver} This instance for chaining.
+   */
+  setHookManager(hookManager) {
+    this.hookManager = hookManager;
+    return this;
+  }
 };
+

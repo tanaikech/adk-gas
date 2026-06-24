@@ -29,7 +29,7 @@
  *    - Copy its ID and set it as `logSpreadsheetId` in the `object` configuration below.
  */
 
-const { MCPA2Aserver } = GASADK;
+var MCPA2Aserver = (typeof GASADK !== 'undefined') ? GASADK.MCPA2Aserver : (typeof MCPA2Aserver !== 'undefined' ? MCPA2Aserver : null);
 
 const API_KEY =
   PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
@@ -39,7 +39,7 @@ const WEB_APPS_URL =
 // Unified Server Configuration Properties
 const object = {
   apiKey: API_KEY,
-  model: "models/gemini-3-flash-preview",
+  model: "models/gemini-3.1-flash-lite",
   accessKey: "sample",
   // logSpreadsheetId: "YOUR_SPREADSHEET_ID_HERE", // Set your Google Spreadsheet ID to activate multi-channel logging
 };

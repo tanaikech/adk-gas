@@ -15,13 +15,13 @@
  */
 
 function executeA2AJSONTestSuite() {
-  const { LlmAgent } = GASADK;
+  const LlmAgent = (typeof GASADK !== 'undefined') ? GASADK.LlmAgent : (typeof LlmAgent !== 'undefined' ? LlmAgent : null);
 
   // --- CONFIGURATION REQUIRED ---
   // Replace this placeholder with the actual Web App URL deployed from A2A_MCP_Server.js
   const A2A_SERVER_WEBAPP_URL =
     "https://script.google.com/macros/s/{deploymentID}/exec";
-  const MODEL_NAME = "models/gemini-3-flash-preview";
+  const MODEL_NAME = "models/gemini-3.1-flash-lite";
 
   const properties = PropertiesService.getScriptProperties();
   const API_KEY = properties.getProperty("GEMINI_API_KEY");

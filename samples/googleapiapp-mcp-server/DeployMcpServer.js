@@ -163,7 +163,7 @@ function main(e) {
   const server = new MCPA2Aserver();
   server.setServices({ lock: lock });
   server.apiKey = API_KEY;
-  server.model = "models/gemini-3-flash-preview";
+  server.model = "models/gemini-3.1-flash-lite";
   server.a2a = true;
   server.mcp = true;
 

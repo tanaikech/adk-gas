@@ -63,7 +63,7 @@ var LlmAgent = class LlmAgent {
 
     this.name = config.name || "Agent";
     this.description = config.description || "";
-    this.model = config.model || "models/gemini-3-flash-preview";
+    this.model = config.model || "models/gemini-3.1-flash-lite";
     this.instruction = config.instruction || "";
     this.state = config.state || {};
 

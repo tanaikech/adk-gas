@@ -11,9 +11,10 @@
  * Ensure that the GEMINI_API_KEY property is correctly set in your Script Properties.
  */
 function executeChatHistoryTestSuite() {
-  const { LlmAgent, A2AApp } = GASADK;
+  const LlmAgent = (typeof GASADK !== 'undefined') ? GASADK.LlmAgent : (typeof LlmAgent !== 'undefined' ? LlmAgent : null);
+  const A2AApp = (typeof GASADK !== 'undefined') ? GASADK.A2AApp : (typeof A2AApp !== 'undefined' ? A2AApp : null);
   const A2A_SERVER_URL = "YOUR_A2A_SERVER_URL"; // "https://script.google.com/macros/s/{deploymentId}/exec/.well-known/agent-card.json?accessKey=sample";
-  const MODEL_NAME = "models/gemini-3-flash-preview";
+  const MODEL_NAME = "models/gemini-3.1-flash-lite";
 
   const properties = PropertiesService.getScriptProperties();
   const API_KEY = properties.getProperty("GEMINI_API_KEY");
