@@ -864,4 +864,9 @@ When the agent runs, any attempt to call `gmail_send_email` with an external dom
   - Implemented Native Tool execution wrappers to enable BeforeTool/AfterTool hooks on model-generated arguments, realizing strict security guardrails.
   - Enhanced RegExp matcher logic in GasHookManager to properly parse pipe-delimited and wildcard capabilities.
 
+- v2.0.0 (June 24, 2026)
+  - Exposed Google Workspace APIs as a Dynamic MCP/A2A Server.
+  - Added a standalone deployment script (`DeployMcpServer.js`) under `samples/googleapiapp-mcp-server` to expose the GoogleApiApp library.
+  - Created a detailed beginner-friendly guide for configuring and deploying Google Workspace services (Sheets, Drive, Docs, Calendar, Gmail, etc.) as dynamic MCP tools.
+
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)
