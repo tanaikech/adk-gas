@@ -26,7 +26,7 @@ var MCPApp = class MCPApp {
     } = object;
 
     /** @private */
-    this.model = model || "models/gemini-3.1-flash-lite";
+    this.model = model || "models/gemini-4-hydrogen";
 
     /** @private */
     this.accessKey = accessKey;
@@ -649,7 +649,7 @@ var MCPApp = class MCPApp {
     this.clientInfo = { name: "MCPApp_client", version: "1.0.0" };
  
     /** @private */
-    this.model = object.model || this.model || "models/gemini-3.1-flash-lite";
+    this.model = object.model || this.model || "models/gemini-4-hydrogen";
 
     /** @private */
     this.id = 0;
@@ -721,6 +721,7 @@ var MCPApp = class MCPApp {
       "- DO NOT invent or hallucinate function names. Use EXACTLY the names provided in the <Functions> list.",
       "- Ask the user for clarification if the request is irreconcilably vague.",
       "- Do NOT output or suggest executable code (e.g., 'tool_code' blocks). Only provide the requested format.",
+      `- Keep each allocated "task" description concise (1-2 sentences). NEVER copy large raw data payloads or file lists from <UserPrompt> into the "task" string.`,
       `- Ensure all allocated tasks are terminal. Do not instruct the model to verify task completion or delivery status.`,
       `- If you require the current datetime context, use: "${currentTimestamp}" operating within timezone ${this.timezone}.`,
       "</Important>",
@@ -747,22 +748,44 @@ var MCPApp = class MCPApp {
       },
     };
 
+    let totalTokenCount = 0;
+    let llmCallCount = 0;
+    const unwrapTelemetry = (raw) => {
+      if (raw && typeof raw === "object" && raw.returnValue !== undefined) {
+        totalTokenCount += raw.totalTokenCount || 0;
+        llmCallCount += raw.llmCallCount || 1;
+        return raw.returnValue;
+      }
+      llmCallCount += 1;
+      return raw;
+    };
+
+    const isThinkingLevelModel = /(?:^|\/)gemini-[34](?:[-.]|$)/i.test(
+      this.model,
+    );
+    const lowThinkingGenConfig = isThinkingLevelModel
+      ? { generationConfig: { thinkingConfig: { thinkingLevel: "LOW" } } }
+      : {};
+
     const setupObj = {
       apiKey: this.clientObject.apiKey,
       systemInstruction: {
         parts: [{ text: systemInstructionText }],
-        role: "model",
       },
       model: this.model,
       responseMimeType: "application/json",
       responseSchema,
+      exportTotalTokens: true,
+      ...lowThinkingGenConfig,
     };
 
     const geminiOrchestrator = new GeminiWithFiles(setupObj);
     const orchestratorPrompt = `User's input prompt:\n<UserPrompt>${this.clientObject.prompt}</UserPrompt>`;
-    const executedOrders = geminiOrchestrator.generateContent({
-      q: orchestratorPrompt,
-    });
+    const executedOrders = unwrapTelemetry(
+      geminiOrchestrator.generateContent({
+        q: orchestratorPrompt,
+      }),
+    );
 
     if (!Array.isArray(executedOrders) || executedOrders.length === 0) {
       const errObj = {
@@ -819,11 +842,13 @@ var MCPApp = class MCPApp {
       console.log(`--- Executing function: "${name}" | Objective: "${task}"`);
 
       const funcCallWrapper = {
-        params_: {
-          [name]: this.functions.params_[name],
-        },
-        [name]: this.functions[name],
+        params_: {},
       };
+
+      if (this.functions.params_[name] && typeof this.functions[name] === "function") {
+        funcCallWrapper.params_[name] = this.functions.params_[name];
+        funcCallWrapper[name] = this.functions[name];
+      }
 
       if (
         name !== "without_function" &&
@@ -835,15 +860,9 @@ var MCPApp = class MCPApp {
           this.functions["without_function"];
       }
 
-      if (name !== "check_process" && this.functions.params_["check_process"]) {
-        funcCallWrapper.params_["check_process"] =
-          this.functions.params_["check_process"];
-        funcCallWrapper["check_process"] = this.functions["check_process"];
-      }
-
-      const allowedTools = Array.from(
-        new Set([name, "without_function", "check_process"]),
-      );
+      // Only expose check_process when the planned step is explicitly "check_process",
+      // preventing models from prematurely halting the pipeline on normal tool steps.
+      const allowedTools = Object.keys(funcCallWrapper.params_);
 
       const executeObj = {
         apiKey: this.clientObject.apiKey,
@@ -851,12 +870,13 @@ var MCPApp = class MCPApp {
         functions: funcCallWrapper,
         systemInstruction: {
           parts: [{ text: executionSystemInstruction }],
-          role: "model",
         },
         history: conversationHistory,
+        exportTotalTokens: true,
+        ...lowThinkingGenConfig,
         toolConfig: {
           functionCallingConfig: {
-            mode: "any",
+            mode: "ANY",
             allowedFunctionNames: allowedTools,
           },
         },
@@ -866,7 +886,9 @@ var MCPApp = class MCPApp {
       const executionPrompt = `Current execution objective:\n<Task>${task}</Task>`;
 
       // Execute inner sequence. Returns standard text OR intercepts _gemini_halt signals safely.
-      const res = geminiExecutor.generateContent({ q: executionPrompt });
+      const res = unwrapTelemetry(
+        geminiExecutor.generateContent({ q: executionPrompt }),
+      );
 
       // Cleaned up, robust Halt Signal evaluation
       if (res && typeof res === "object" && res._gemini_halt) {
@@ -891,10 +913,13 @@ var MCPApp = class MCPApp {
           typeof res === "string" ? res : res.text || JSON.stringify(res);
         generationResults.push(fallbackText);
 
-        const lastHistoryPart =
-          geminiExecutor.history[geminiExecutor.history.length - 1]?.parts?.[0];
-        if (lastHistoryPart && !lastHistoryPart.functionResponse) {
-          lastHistoryPart.text = fallbackText;
+        const lastHistoryParts =
+          geminiExecutor.history[geminiExecutor.history.length - 1]?.parts || [];
+        const targetTextPart = lastHistoryParts.find(
+          (p) => p && !p.thought && !p.functionResponse && p.text !== undefined,
+        );
+        if (targetTextPart) {
+          targetTextPart.text = fallbackText;
         }
       } else {
         generationResults.push(
@@ -928,22 +953,28 @@ var MCPApp = class MCPApp {
       (e) => typeof e === "string",
     );
 
-    // Final summarization phase if text results exist
-    if (standardTextResults.length > 0) {
+    // Final summarization phase if text results exist (skip if caller opted out on single result)
+    if (
+      standardTextResults.length > 0 &&
+      !(this.clientObject.skipFinalSummary && standardTextResults.length === 1)
+    ) {
       const geminiSummarizer = new GeminiWithFiles({
         apiKey: this.clientObject.apiKey,
         model: this.model,
         history: conversationHistory,
+        exportTotalTokens: true,
       });
-      const finalSummary = geminiSummarizer.generateContent({
-        parts: [
-          {
-            text: "Synthesize the results strictly answering the user's initial prompt.",
-          },
-          { text: `<Question>${this.clientObject.prompt}</Question>` },
-          { text: `<Answers>\n${standardTextResults.join("\n")}\n</Answers>` },
-        ],
-      });
+      const finalSummary = unwrapTelemetry(
+        geminiSummarizer.generateContent({
+          parts: [
+            {
+              text: "Synthesize the results strictly answering the user's initial prompt.",
+            },
+            { text: `<Question>${this.clientObject.prompt}</Question>` },
+            { text: `<Answers>\n${standardTextResults.join("\n")}\n</Answers>` },
+          ],
+        }),
+      );
       geminiOrchestrator.history = geminiSummarizer.history;
       finalOutputs = [
         finalSummary,
@@ -960,7 +991,12 @@ var MCPApp = class MCPApp {
     ]);
     console.log("--- end: Sequence Execution completed.");
 
-    return { result: finalOutputs, history: geminiOrchestrator.history };
+    return {
+      result: finalOutputs,
+      history: geminiOrchestrator.history,
+      totalTokenCount,
+      llmCallCount,
+    };
   }
 
   /**
@@ -1133,11 +1169,53 @@ var MCPApp = class MCPApp {
       activeHeaders = { ...activeHeaders, ...customHeaders };
     }
 
+    // Streamable HTTP MCP compatibility: add default Accept header if not explicitly provided
+    const hasAcceptHeader = Object.keys(activeHeaders).some(
+      (k) => k.toLowerCase() === "accept",
+    );
+    if (!hasAcceptHeader) {
+      activeHeaders["Accept"] = "application/json, text/event-stream";
+    }
+
     if (Object.keys(activeHeaders).length > 0) {
       requestConfig.headers = activeHeaders;
     }
 
     return requestConfig;
+  }
+
+  /**
+   * ### Description
+   * Parses a JSON-RPC 2.0 response from either standard `application/json` or
+   * Streamable HTTP SSE (`text/event-stream`) payloads.
+   *
+   * @param {GoogleAppsScript.URL_Fetch.HTTPResponse} response
+   * @return {Object|null}
+   * @private
+   */
+  parseJsonRpcResponse_(response) {
+    const bodyText = (response.getContentText() || "").trim();
+    if (!bodyText) return null;
+
+    try {
+      return JSON.parse(bodyText);
+    } catch (jsonErr) {
+      // Fallback for Streamable HTTP SSE (text/event-stream): extract last valid JSON data frame
+      const dataLines = bodyText
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .filter((line) => line && line !== "[DONE]");
+
+      for (let i = dataLines.length - 1; i >= 0; i--) {
+        try {
+          return JSON.parse(dataLines[i]);
+        } catch (e) {
+          // Continue scanning prior SSE frames
+        }
+      }
+      return null;
+    }
   }
 
   /**
@@ -1174,17 +1252,66 @@ var MCPApp = class MCPApp {
    */
   getLists_({ method, requests }) {
     this.fetch_(requests).forEach((response, index) => {
-      if (response.getResponseCode() === 200) {
-        try {
-          const parsedRes = JSON.parse(response.getContentText());
-          if (parsedRes?.result) {
-            this.mcpServerObj[index][method] = parsedRes;
-          }
-        } catch (error) {
-          // Silent catch to continue loop resilience
+      const code = response.getResponseCode();
+      const parsedRes = this.parseJsonRpcResponse_(response);
+      if (parsedRes?.result && !parsedRes?.error) {
+        if (code !== 200) {
+          console.warn(
+            `[MCPApp] ${method} returned HTTP ${code} with valid JSON-RPC result; accepting payload.`,
+          );
         }
+        this.mcpServerObj[index][method] = parsedRes;
+        this.fetchRemainingPages_(index, method, parsedRes);
+      } else if (code !== 200 && method === "tools/list") {
+        console.warn(
+          `[MCPApp] ${method} returned HTTP ${code}: ${(response.getContentText() || "").slice(0, 200)}`,
+        );
       }
     });
+  }
+
+  /**
+   * ### Description
+   * Follows MCP `nextCursor` pagination for `tools/list`, `resources/list`, and `prompts/list`.
+   *
+   * @param {number} serverIndex
+   * @param {string} method
+   * @param {Object} initialParsed
+   * @private
+   */
+  fetchRemainingPages_(serverIndex, method, initialParsed) {
+    const subKey = method.split("/")[0];
+    let cursor = initialParsed?.result?.nextCursor;
+    let pages = 0;
+    const maxPages = 10;
+    const serverEntry = this.mcpServerObj[serverIndex];
+    if (!serverEntry) return;
+
+    while (cursor && pages < maxPages) {
+      pages++;
+      const payloadStr = JSON.stringify({
+        method,
+        params: { cursor },
+        jsonrpc: this.jsonrpc,
+        id: ++this.id,
+      });
+      const req = this.createRequest_({
+        u: serverEntry.serverUrl,
+        obj: payloadStr,
+        customHeaders: serverEntry.headers,
+      });
+      const resp = this.fetch_([req])[0];
+      if (!resp || resp.getResponseCode() !== 200) break;
+      const nextParsed = this.parseJsonRpcResponse_(resp);
+      const nextItems = nextParsed?.result?.[subKey];
+      if (Array.isArray(nextItems) && nextItems.length > 0) {
+        if (!Array.isArray(initialParsed.result[subKey])) {
+          initialParsed.result[subKey] = [];
+        }
+        initialParsed.result[subKey].push(...nextItems);
+      }
+      cursor = nextParsed?.result?.nextCursor;
+    }
   }
 
   /**
@@ -1208,16 +1335,21 @@ var MCPApp = class MCPApp {
 
     if (requestPool.length > 0) {
       this.fetch_(requestPool).forEach((response, i) => {
-        if (response.getResponseCode() === 200) {
-          try {
-            const { method, serverIndex } = metadata[i];
-            const parsedObj = JSON.parse(response.getContentText());
-            if (parsedObj?.result) {
-              this.mcpServerObj[serverIndex][method] = parsedObj;
-            }
-          } catch (error) {
-            // Processing failure intentionally omitted for stability.
+        const { method, serverIndex } = metadata[i];
+        const code = response.getResponseCode();
+        const parsedObj = this.parseJsonRpcResponse_(response);
+        if (parsedObj?.result && !parsedObj?.error) {
+          if (code !== 200) {
+            console.warn(
+              `[MCPApp] ${method} returned HTTP ${code} with valid JSON-RPC result; accepting payload.`,
+            );
           }
+          this.mcpServerObj[serverIndex][method] = parsedObj;
+          this.fetchRemainingPages_(serverIndex, method, parsedObj);
+        } else if (code !== 200 && method === "tools/list") {
+          console.warn(
+            `[MCPApp] ${method} returned HTTP ${code}: ${(response.getContentText() || "").slice(0, 200)}`,
+          );
         }
       });
     }
@@ -1246,7 +1378,20 @@ var MCPApp = class MCPApp {
           customHeaders,
         }),
       ]);
-      return responseArray[0].getContentText();
+      const resp = responseArray[0];
+      const statusCode = resp.getResponseCode();
+      const rawText = resp.getContentText();
+      const parsed = this.parseJsonRpcResponse_(resp);
+      if (statusCode < 200 || statusCode >= 300) {
+        if (parsed && parsed.result && !parsed.error) {
+          console.warn(
+            `[MCPApp] Tool call returned HTTP ${statusCode} with valid JSON-RPC result; accepting payload.`,
+          );
+          return JSON.stringify(parsed);
+        }
+        throw new Error(`[MCP HTTP ${statusCode}] ${rawText}`);
+      }
+      return parsed ? JSON.stringify(parsed) : rawText;
     };
 
     const aggregatedServerTools = this.mcpServerObj.reduce(
@@ -1273,7 +1418,7 @@ var MCPApp = class MCPApp {
                   method: routingMap[endpointKey],
                   params: { uri },
                   jsonrpc: this.jsonrpc,
-                  id: this.id++,
+                  id: ++this.id,
                 };
                 return fetchWrapper({
                   payload: dispatchPayload,
@@ -1306,9 +1451,13 @@ var MCPApp = class MCPApp {
                 console.log(`--- Generating Prompt Logic: ${cleanName}`);
                 const dispatchPayload = {
                   method: routingMap[endpointKey],
-                  params: { name: cleanName, arguments: params },
+                  params: {
+                    name: name,
+                    arguments:
+                      params && typeof params === "object" ? params : {},
+                  },
                   jsonrpc: this.jsonrpc,
-                  id: this.id++,
+                  id: ++this.id,
                 };
                 return fetchWrapper({
                   payload: dispatchPayload,
@@ -1321,6 +1470,9 @@ var MCPApp = class MCPApp {
                 title: name,
                 description,
                 parameters: inputSchema,
+                ...(definition.annotations
+                  ? { annotations: definition.annotations }
+                  : {}),
               };
               executionCallback = (params) => {
                 if (this.hookManager) {
@@ -1342,9 +1494,13 @@ var MCPApp = class MCPApp {
                 console.log(`--- Activating Tool Service: ${cleanName}`);
                 const dispatchPayload = {
                   method: routingMap[endpointKey],
-                  params: { name: cleanName, arguments: params },
+                  params: {
+                    name: name,
+                    arguments:
+                      params && typeof params === "object" ? params : {},
+                  },
                   jsonrpc: this.jsonrpc,
-                  id: this.id++,
+                  id: ++this.id,
                 };
                 let result = fetchWrapper({
                   payload: dispatchPayload,
@@ -1419,7 +1575,15 @@ var MCPApp = class MCPApp {
       mcpServerUrls,
       batchProcess = false,
       mcpServerObj,
+      cachedMcpServerObj,
     } = this.clientObject;
+
+    // Fast-path: Reuse already-discovered MCP server metadata (from LlmAgent cache)
+    if (Array.isArray(cachedMcpServerObj) && cachedMcpServerObj.length > 0) {
+      this.mcpServerObj = cachedMcpServerObj;
+      this.createFunctions_();
+      return this;
+    }
 
     // Load pre-installed Server Object library boundaries
     if (Array.isArray(mcpServerObj) && mcpServerObj.length > 0) {
@@ -1505,20 +1669,39 @@ var MCPApp = class MCPApp {
               "server --> client",
               bodyText,
             ]);
-            try {
+            const parsedInit = this.parseJsonRpcResponse_(response);
+            const serverHeaders = { ...validServers[idx].headers };
+            const respHeaders =
+              typeof response.getAllHeaders === "function"
+                ? response.getAllHeaders() || {}
+                : {};
+            const sessionKey = Object.keys(respHeaders).find(
+              (k) => k.toLowerCase() === "mcp-session-id",
+            );
+            if (sessionKey && respHeaders[sessionKey]) {
+              const rawSess = respHeaders[sessionKey];
+              serverHeaders["Mcp-Session-Id"] = Array.isArray(rawSess)
+                ? rawSess[0]
+                : rawSess;
+            }
+            const negotiatedVersion = parsedInit?.result?.protocolVersion;
+            if (negotiatedVersion && String(negotiatedVersion) >= "2025-06-18") {
+              serverHeaders["MCP-Protocol-Version"] = negotiatedVersion;
+            }
+            if (parsedInit) {
               acc.push({
                 serverUrl: validServers[idx].serverUrl,
-                headers: validServers[idx].headers,
+                headers: serverHeaders,
                 original: validServers[idx].original,
-                [methodInit]: JSON.parse(bodyText),
+                [methodInit]: parsedInit,
               });
-            } catch (e) {
+            } else {
               console.warn(
                 `Critical Format Error. Payload from "${validServers[idx].serverUrl}" is not standard MCP JSON. Snippet: ${bodyText.substring(0, 50)}...`,
               );
               acc.push({
                 serverUrl: validServers[idx].serverUrl,
-                headers: validServers[idx].headers,
+                headers: serverHeaders,
                 original: validServers[idx].original,
                 [methodInit]: null,
               });
@@ -1545,8 +1728,8 @@ var MCPApp = class MCPApp {
         params: {
           requestId: this.id,
           reason: `Halted: Integration failure. InternalError code ${this.ErrorCode.InternalError}`,
-          jsonrpc: this.jsonrpc,
         },
+        jsonrpc: this.jsonrpc,
       };
 
       const categorizedReqs = this.mcpServerObj.reduce(
@@ -1695,25 +1878,41 @@ var MCPApp = class MCPApp {
       );
     }
 
-    const parts = url.split("?");
-    if (parts.length === 1) return { url: parts[0], queryParameters: null };
+    const qIdx = url.indexOf("?");
+    if (qIdx === -1) return { url, queryParameters: null };
 
-    const [baseUrl, query] = parts;
-    if (query) {
-      const queryParameters = query.split("&").reduce((acc, paramBlock) => {
-        const [keyRaw, valRaw] = paramBlock.split("=");
-        const key = keyRaw.trim();
-        const valueStr = valRaw.trim();
-        const valueDecoded = isNaN(valueStr) ? valueStr : Number(valueStr);
+    const baseUrl = url.slice(0, qIdx);
+    const query = url.slice(qIdx + 1);
+    if (!query) return { url: baseUrl, queryParameters: null };
 
-        if (acc[key]) acc[key].push(valueDecoded);
-        else acc[key] = [valueDecoded];
+    const safeDecode = (s) => {
+      try {
+        return decodeURIComponent(s);
+      } catch (e) {
+        return s;
+      }
+    };
 
-        return acc;
-      }, {});
-      return { url: baseUrl, queryParameters };
-    }
-    return null;
+    const queryParameters = query.split("&").reduce((acc, paramBlock) => {
+      if (!paramBlock) return acc;
+      const eqIdx = paramBlock.indexOf("=");
+      const keyRaw = eqIdx === -1 ? paramBlock : paramBlock.slice(0, eqIdx);
+      const valRaw = eqIdx === -1 ? "" : paramBlock.slice(eqIdx + 1);
+      const key = safeDecode(keyRaw.trim());
+      if (!key) return acc;
+      const valueStr = safeDecode(valRaw.trim());
+
+      if (acc[key]) acc[key].push(valueStr);
+      else acc[key] = [valueStr];
+
+      return acc;
+    }, {});
+
+    return {
+      url: baseUrl,
+      queryParameters:
+        Object.keys(queryParameters).length > 0 ? queryParameters : null,
+    };
   }
 
   /**

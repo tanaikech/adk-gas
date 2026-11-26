@@ -65,7 +65,7 @@ var A2AApp = class A2AApp {
    * @param {String} [object.accessKey] Access key for A2A server (optional).
    * @param {Boolean} [object.log] Enable logging to Google Sheets (default: false).
    * @param {String} [object.spreadsheetId] Spreadsheet ID for logs.
-   * @param {String} [object.model] Model name (default: "models/gemini-3.1-flash-lite").
+   * @param {String} [object.model] Model name (default: "models/gemini-4-hydrogen").
    */
   constructor(object = {}) {
     const { accessKey = null, log = false, spreadsheetId, model } = object;
@@ -74,7 +74,7 @@ var A2AApp = class A2AApp {
     this.accessKey = accessKey;
 
     /** @private */
-    this.model = model || "models/gemini-3.1-flash-lite";
+    this.model = model || "models/gemini-4-hydrogen";
 
     /** @private */
     this.jsonrpc = "2.0";
@@ -250,26 +250,6 @@ var A2AApp = class A2AApp {
     console.log("--- Server side initialized");
     this.errorProcess_(object);
     let id = "No ID";
-    const lock = this.lock;
-
-    // [Phase 1: Concurrency Control] Server-side locking to prevent race conditions
-    if (!lock.tryLock(350000)) {
-      const msg =
-        "[Phase 1: Concurrency Control] Timeout. Lock could not be acquired.";
-      console.error(msg);
-      return this.createErrorResponse_(
-        `Internal server error. Error message: ${msg}`,
-        id,
-        "[Phase 1: Concurrency Control]",
-      );
-    }
-    this.addLog_(
-      new Date(),
-      "[Phase 1: Concurrency Control]",
-      id,
-      "server internal",
-      "Lock acquired successfully.",
-    );
 
     try {
       const { eventObject, agentCardUrls = [], agentCards = [] } = object;
@@ -291,8 +271,6 @@ var A2AApp = class A2AApp {
         id,
         "Server Main Process",
       );
-    } finally {
-      lock.releaseLock();
     }
   }
 
@@ -305,35 +283,6 @@ var A2AApp = class A2AApp {
   client(object = {}) {
     this.contextType = "client";
     console.log("--- Client side initialized");
-    const lock = this.lock;
-
-    // [Phase 1: Concurrency Control] Client-side locking
-    if (!lock.tryLock(350000)) {
-      const msg =
-        "[Phase 1: Concurrency Control] Timeout. Lock could not be acquired.";
-      console.error(msg);
-      const errObj = {
-        error: {
-          message: `[A2A Client Error] Internal server error. Error message: ${msg}`,
-        },
-      };
-      this.addLog_(
-        new Date(),
-        "[Phase 1: Concurrency Control]",
-        null,
-        "client internal",
-        JSON.stringify(errObj),
-      );
-      this.log_();
-      return errObj;
-    }
-    this.addLog_(
-      new Date(),
-      "[Phase 1: Concurrency Control]",
-      null,
-      "client internal",
-      "Lock acquired successfully.",
-    );
 
     try {
       // [Phase 2: Agent Discovery] Fetch Agent Cards
@@ -383,8 +332,6 @@ var A2AApp = class A2AApp {
       );
       this.log_();
       return errObj;
-    } finally {
-      lock.releaseLock();
     }
   }
 
@@ -699,7 +646,12 @@ var A2AApp = class A2AApp {
    */
   log_() {
     if (!this.log || !this.sheet || this.values.length === 0) return;
+    const lock = this.lock;
+    let locked = false;
     try {
+      if (lock && typeof lock.tryLock === "function") {
+        locked = lock.tryLock(15000);
+      }
       const rows = this.values.map((r) =>
         r.map((c) => (typeof c === "string" ? c.substring(0, 40000) : c)),
       );
@@ -709,6 +661,10 @@ var A2AApp = class A2AApp {
       this.values = [];
     } catch (err) {
       console.error("--- Failed to write to log sheet.", err);
+    } finally {
+      if (locked && lock && typeof lock.releaseLock === "function") {
+        lock.releaseLock();
+      }
     }
   }
 
@@ -1476,21 +1432,28 @@ var A2AApp = class A2AApp {
                 ];
               }
 
-              // Manually patch the history array as the loop bypass prevents GeminiWithFiles from appending the call details automatically.
+              // Manually patch the history array while preserving Gemini 3/4 thoughtSignature.
               if (funcRes.name && funcRes.argsObj) {
-                gg.history.push({
-                  role: "model",
-                  parts: [
-                    {
+                const matchedPart = Array.isArray(gg._lastModelParts)
+                  ? gg._lastModelParts.find(
+                      (p) => p?.functionCall?.name === funcRes.name,
+                    )
+                  : null;
+                const modelFcPart = matchedPart
+                  ? { ...matchedPart }
+                  : {
                       functionCall: {
                         name: funcRes.name,
                         args: funcRes.argsObj,
                       },
-                    },
-                  ],
+                      thoughtSignature: "skip_thought_signature_validator",
+                    };
+                gg.history.push({
+                  role: "model",
+                  parts: [modelFcPart],
                 });
                 gg.history.push({
-                  role: "function",
+                  role: "user",
                   parts: [
                     {
                       functionResponse: {
@@ -1693,16 +1656,30 @@ var A2AApp = class A2AApp {
         "Please provide a valid URL (String) including query parameters.",
       );
     }
-    const [baseUrl, query] = url.split("?");
+    const qIdx = url.indexOf("?");
+    if (qIdx === -1) {
+      return { url, queryParameters: null };
+    }
+    const baseUrl = url.slice(0, qIdx);
+    const query = url.slice(qIdx + 1);
     if (!query) {
       return { url: baseUrl, queryParameters: null };
     }
+    const safeDecode = (s) => {
+      try {
+        return decodeURIComponent(s);
+      } catch (e) {
+        return s;
+      }
+    };
     const queryParameters = query.split("&").reduce((acc, param) => {
-      const [key, rawValue] = param.split("=");
-      if (!key) return acc;
-      const k = key.trim();
-      let v = rawValue ? rawValue.trim() : "";
-      v = isNaN(Number(v)) || v === "" ? v : Number(v);
+      if (!param) return acc;
+      const eqIdx = param.indexOf("=");
+      const keyRaw = eqIdx === -1 ? param : param.slice(0, eqIdx);
+      const valRaw = eqIdx === -1 ? "" : param.slice(eqIdx + 1);
+      const k = safeDecode(keyRaw.trim());
+      if (!k) return acc;
+      const v = safeDecode(valRaw.trim());
       if (acc[k]) {
         acc[k].push(v);
       } else {
@@ -1710,7 +1687,11 @@ var A2AApp = class A2AApp {
       }
       return acc;
     }, {});
-    return { url: baseUrl, queryParameters };
+    return {
+      url: baseUrl,
+      queryParameters:
+        Object.keys(queryParameters).length > 0 ? queryParameters : null,
+    };
   }
 
   /**

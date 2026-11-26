@@ -62,7 +62,7 @@ var MCPA2Aserver = class MCPA2Aserver {
     this.apiKey = "";
 
     /** @type {String} Model version to be used for generative AI. */
-    this.model = "models/gemini-3.1-flash-lite";
+    this.model = "models/gemini-4-hydrogen";
 
     /** @type {String} Access key to restrict access to the Web Apps. */
     this.accessKey = "";
@@ -106,13 +106,16 @@ var MCPA2Aserver = class MCPA2Aserver {
         ".well-known/agent.json",
       ],
       METHODS: {
-        A2A: ["tasks/send", "message/send"],
+        A2A: ["tasks/send", "message/send", "SendMessage", "GetTask"],
         MCP: [
           "initialize",
           "notifications/initialized",
           "notifications/cancelled",
+          "ping",
           "resources/list",
+          "resources/read",
           "prompts/list",
+          "prompts/get",
           "tools/list",
           "tools/call",
         ],

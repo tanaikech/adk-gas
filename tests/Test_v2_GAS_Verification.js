@@ -12,7 +12,7 @@
  *
  * @description
  * Complete validation test script for GASADK v2.0.0 adaptation upgrades.
- * Validates GasHookManager integration, modern default model (gemini-3.1-flash-lite) setup,
+ * Validates GasHookManager integration, modern default model (gemini-4-hydrogen) setup,
  * model overrides, and hook execution across:
  *  - GeminiWithFiles
  *  - A2AApp
@@ -178,12 +178,12 @@ function runV2GASVerification() {
     var gemini = new geminiClass({ apiKey: "mock-api-key", exportTotalTokens: true });
     gemini.setHookManager(hookManager);
 
-    console.log("Checking model name modern default (Expected: 'models/gemini-3.1-flash-lite')...");
+    console.log("Checking model name modern default (Expected: 'models/gemini-4-hydrogen')...");
     console.log("Active Model: " + gemini.model);
-    if (gemini.model !== "models/gemini-3.1-flash-lite") {
+    if (gemini.model !== "models/gemini-4-hydrogen") {
       throw new Error("FAIL: Default model name update failed. Got: " + gemini.model);
     }
-    console.log("   [Pass] Default model name is gemini-3.1-flash-lite.");
+    console.log("   [Pass] Default model name is gemini-4-hydrogen.");
 
     // Normal query
     console.log("Scenario A: Executing safe query 'What is 2+2?'...");
@@ -225,10 +225,10 @@ function runV2GASVerification() {
     var a2aDefaultModel = new a2aClass({ apiKey: "mock-api-key" });
     console.log("Checking A2A modern default model...");
     console.log("A2A Default Model: " + a2aDefaultModel.model);
-    if (a2aDefaultModel.model !== "models/gemini-3.1-flash-lite") {
+    if (a2aDefaultModel.model !== "models/gemini-4-hydrogen") {
       throw new Error("FAIL: A2A default model is incorrect.");
     }
-    console.log("   [Pass] Default model is gemini-3.1-flash-lite.");
+    console.log("   [Pass] Default model is gemini-4-hydrogen.");
 
     a2aDefaultModel.setHookManager(hookManager);
 
@@ -250,10 +250,10 @@ function runV2GASVerification() {
 
     console.log("Checking MCPApp default model...");
     console.log("MCP Model: " + mcp.model);
-    if (mcp.model !== "models/gemini-3.1-flash-lite") {
+    if (mcp.model !== "models/gemini-4-hydrogen") {
       throw new Error("FAIL: MCPApp default model is incorrect.");
     }
-    console.log("   [Pass] MCPApp default model is gemini-3.1-flash-lite.");
+    console.log("   [Pass] MCPApp default model is gemini-4-hydrogen.");
 
     // Verify MCP tool execution wrapped by hooks
     console.log("Scenario A: Executing server-side tool 'read_public_data'...");
@@ -274,10 +274,10 @@ function runV2GASVerification() {
 
     console.log("Checking MCPA2Aserver default model...");
     console.log("Server Model: " + mcpA2A.model);
-    if (mcpA2A.model !== "models/gemini-3.1-flash-lite") {
+    if (mcpA2A.model !== "models/gemini-4-hydrogen") {
       throw new Error("FAIL: MCPA2Aserver default model is incorrect.");
     }
-    console.log("   [Pass] Default model is gemini-3.1-flash-lite.");
+    console.log("   [Pass] Default model is gemini-4-hydrogen.");
 
     console.log("Checking hook propagation on MCPA2Aserver...");
     if (mcpA2A.hookManager !== hookManager) {

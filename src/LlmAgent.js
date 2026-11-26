@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v2.0.0] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
+ * [Production Release v2.1.0] - Gemini 4 Hydrogen Edition, Hybrid Direct Mode & Google Workspace MCP Support
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -63,7 +63,7 @@ var LlmAgent = class LlmAgent {
 
     this.name = config.name || "Agent";
     this.description = config.description || "";
-    this.model = config.model || "models/gemini-3.1-flash-lite";
+    this.model = config.model || "models/gemini-4-hydrogen";
     this.instruction = config.instruction || "";
     this.state = config.state || {};
 
@@ -72,6 +72,14 @@ var LlmAgent = class LlmAgent {
     this.timeoutMs = config.timeoutMs || 280000; // 280 seconds (GAS safe limit)
     this.maxResultLength = config.maxResultLength || 20000; // Bulletproofing threshold
     this.startTime = null;
+
+    // vNext Opt-In Modernization Controls (100% Backward-Compatible Defaults)
+    this.executionMode = config.executionMode || "planner"; // "planner" | "direct" | "auto"
+    this.parallelExecution = Boolean(config.parallelExecution);
+    this.discoveryCacheTtlSec = Number(config.discoveryCacheTtlSec || 0);
+    this.maxHistoryChars = Number(config.maxHistoryChars || 0);
+    this.guardDestructiveMcpTools = Boolean(config.guardDestructiveMcpTools);
+    this.useParametersJsonSchema = Boolean(config.useParametersJsonSchema);
 
     // Capabilities configuration
     this.tools = config.tools || [];
@@ -103,7 +111,68 @@ var LlmAgent = class LlmAgent {
     this.services = null;
     this.capabilities = [];
     this.accumulatedTokens = 0;
+    this.llmCallCount = 0;
     this._capabilitiesInitialized = false;
+  }
+
+  /**
+   * Convenience helper to build official Google Workspace MCP Server configurations.
+   * Supports: "drive", "gmail", "docs", "sheets", "slides", "calendar", "chat".
+   *
+   * @param {string[]} [services=["drive"]] - Workspace service identifiers.
+   * @param {Object} [options={}] - { mode: "v1" | "v1self", token: string }
+   * @returns {Object[]} Array compatible with `LlmAgent({ mcpServers })`.
+   */
+  static createWorkspaceMcpServers(services = ["drive"], options = {}) {
+    const endpointMap = {
+      drive: "https://drivemcp.googleapis.com/mcp",
+      gmail: "https://gmailmcp.googleapis.com/mcp",
+      docs: "https://docsmcp.googleapis.com/mcp",
+      sheets: "https://sheetsmcp.googleapis.com/mcp",
+      slides: "https://slidesmcp.googleapis.com/mcp",
+      calendar: "https://calendarmcp.googleapis.com/mcp",
+      chat: "https://chatmcp.googleapis.com/mcp",
+    };
+    const mode = options.mode === "v1self" ? "v1self" : "v1";
+    const token =
+      options.token ||
+      (typeof ScriptApp !== "undefined" ? ScriptApp.getOAuthToken() : "");
+
+    return (Array.isArray(services) ? services : [services])
+      .map((svc) => String(svc).toLowerCase().trim())
+      .filter((svc) => endpointMap[svc])
+      .map((svc) => ({
+        [`${svc}_mcp`]: {
+          httpUrl: `${endpointMap[svc]}/${mode}`,
+          headers: token ? { authorization: `Bearer ${token}` } : {},
+        },
+      }));
+  }
+
+  /**
+   * Unified logger helper with Notification hook propagation.
+   * @private
+   */
+  _createLogger(logCallback = null) {
+    return (message, data = null) => {
+      const entry = { timestamp: new Date().toISOString(), message, data };
+      this.logs.push(entry);
+      const notifyRes = this.hookManager.execute("Notification", {
+        message,
+        data,
+        toolName: data?.capability_id || "",
+        notification_type: "Log",
+        details: data,
+      });
+      if (notifyRes.systemMessage && typeof logCallback === "function") {
+        logCallback({
+          timestamp: new Date().toISOString(),
+          message: `[Hook Notification Message] ${notifyRes.systemMessage}`,
+          data,
+        });
+      }
+      if (typeof logCallback === "function") logCallback(entry);
+    };
   }
 
   /**
@@ -137,19 +206,28 @@ var LlmAgent = class LlmAgent {
       text = mockedResponse.text;
     } else {
       // Force exportTotalTokens to capture token consumption
-      const clientConfig = { ...activeConfig, exportTotalTokens: true };
+      const clientConfig = {
+        ...activeConfig,
+        exportTotalTokens: true,
+        ...(this.useParametersJsonSchema &&
+        activeConfig.useParametersJsonSchema === undefined
+          ? { useParametersJsonSchema: true }
+          : {}),
+      };
       const rawRes = new GeminiWithFiles(clientConfig).generateContent({ q: activeQuery });
       
       if (rawRes && typeof rawRes === 'object' && rawRes.returnValue !== undefined) {
         text = typeof rawRes.returnValue === 'string' ? rawRes.returnValue : JSON.stringify(rawRes.returnValue);
         const tokens = rawRes.totalTokenCount || 0;
         this.accumulatedTokens = (this.accumulatedTokens || 0) + tokens;
+        this.llmCallCount = (this.llmCallCount || 0) + (rawRes.llmCallCount || 1);
         
         // Quota Safeguard check
         if (this.maxTokensPerSession && this.accumulatedTokens > this.maxTokensPerSession) {
           throw new Error(`CRITICAL: Session aborted. Accumulated token count (${this.accumulatedTokens}) exceeded limit (${this.maxTokensPerSession}).`);
         }
       } else {
+        this.llmCallCount = (this.llmCallCount || 0) + 1;
         text = rawRes;
       }
     }
@@ -305,7 +383,7 @@ var LlmAgent = class LlmAgent {
     // 2. MCP Servers
     if (this.mcpServers?.length > 0) {
       try {
-        const mcpConfig = {};
+        const mcpConfig = { model: this.model };
         if (this.logSpreadsheetId) {
           mcpConfig.log = true;
           mcpConfig.spreadsheetId = this.logSpreadsheetId;
@@ -339,6 +417,7 @@ var LlmAgent = class LlmAgent {
             const toolDescriptions = rawTools.map((t) => ({
               name: t.name,
               description: t.description,
+              parameters: Object.keys(t.inputSchema?.properties || {}),
               required_parameters: t.inputSchema?.required || [],
             }));
 
@@ -356,6 +435,7 @@ var LlmAgent = class LlmAgent {
                 tools: toolDescriptions,
               },
               URL: originalUrlOrObj, // Kept intact for downward GASADK compat
+              _cachedMcpServerObj: obj, // Reuse handshake & tool discovery within session
             });
           });
         }
@@ -594,7 +674,8 @@ var LlmAgent = class LlmAgent {
           const activeArgs = beforeToolRes.hookSpecificOutput?.tool_input || beforeToolRes.tool_input || args;
           
           // Run the original function
-          let result = cap._tool.function(activeArgs);
+          const nativeHandler = cap._tool.function || cap._tool.func;
+          let result = nativeHandler(activeArgs);
           
           // 2. EXECUTE AfterTool Hook with execution result
           const afterToolRes = self.hookManager.execute("AfterTool", {
@@ -628,20 +709,39 @@ var LlmAgent = class LlmAgent {
         return this._generateContent(config, executionPrompt);
       }
       case "MCP Server": {
-        const mcpConfig = {};
+        const mcpConfig = { model: this.model };
         if (this.logSpreadsheetId) {
           mcpConfig.log = true;
           mcpConfig.spreadsheetId = this.logSpreadsheetId;
         }
         const mcpApp = new MCPApp(mcpConfig).setServices(this.services);
-        const tempClient = mcpApp.client({
+        if (typeof mcpApp.setHookManager === "function" && this.hookManager) {
+          mcpApp.setHookManager(this.hookManager);
+        }
+        const clientOpts = {
           apiKey: this.apiKey,
           prompt: executionPrompt,
           mcpServerUrls: [cap.URL],
           batchProcess: true,
+          skipFinalSummary: true,
           history: [...this.history],
-        });
+        };
+        if (cap._cachedMcpServerObj) {
+          clientOpts.cachedMcpServerObj = [cap._cachedMcpServerObj];
+        }
+        const tempClient = mcpApp.client(clientOpts);
         const res = tempClient.callMCPServers();
+        if (res?.totalTokenCount) {
+          this.accumulatedTokens = (this.accumulatedTokens || 0) + res.totalTokenCount;
+        }
+        if (res?.llmCallCount) {
+          this.llmCallCount = (this.llmCallCount || 0) + res.llmCallCount;
+        }
+        if (this.maxTokensPerSession && this.accumulatedTokens > this.maxTokensPerSession) {
+          throw new Error(
+            `CRITICAL: Session aborted. Accumulated token count (${this.accumulatedTokens}) exceeded limit (${this.maxTokensPerSession}).`,
+          );
+        }
         if (res?.error)
           throw new Error(`MCP Error: ${JSON.stringify(res.error)}`);
         return res?.result || res;
@@ -735,23 +835,7 @@ var LlmAgent = class LlmAgent {
         prompt = prompt + "\n\n[Session Start Context]:\n" + sessionContext;
       }
 
-      const log = (message, data = null) => {
-        const entry = { timestamp: new Date().toISOString(), message, data };
-        this.logs.push(entry);
-        
-        const notifyRes = this.hookManager.execute("Notification", { 
-          message, 
-          data, 
-          toolName: data?.capability_id || "",
-          notification_type: "Log",
-          details: data
-        });
-        
-        if (notifyRes.systemMessage && typeof logCallback === "function") {
-          logCallback({ timestamp: new Date().toISOString(), message: `[Hook Notification Message] ${notifyRes.systemMessage}`, data });
-        }
-        if (typeof logCallback === "function") logCallback(entry);
-      };
+      const log = this._createLogger(logCallback);
 
       if (sessionStartRes.systemMessage) {
         log(`[SessionStart Hook Message] ${sessionStartRes.systemMessage}`);
@@ -760,10 +844,33 @@ var LlmAgent = class LlmAgent {
       if (!this._capabilitiesInitialized) this._initializeCapabilities(log);
       log("Agent run sequence initiated", { prompt });
 
-      // EXECUTE PreCompress Hook (Standard lifecycle alignment)
-      const preCompressRes = this.hookManager.execute("PreCompress", { trigger: "auto" });
+      // EXECUTE PreCompress Hook & optional sliding-window history compression
+      const historyChars = JSON.stringify(this.history || []).length;
+      const preCompressRes = this.hookManager.execute("PreCompress", {
+        trigger: "auto",
+        historyChars,
+        maxHistoryChars: this.maxHistoryChars,
+      });
       if (preCompressRes.systemMessage) {
         log(`[PreCompress Hook Message] ${preCompressRes.systemMessage}`);
+      }
+      if (
+        this.maxHistoryChars > 0 &&
+        historyChars > this.maxHistoryChars &&
+        this.history.length > 2
+      ) {
+        while (
+          this.history.length > 2 &&
+          JSON.stringify(this.history).length > this.maxHistoryChars
+        ) {
+          this.history.shift();
+          if (this.history.length > 2 && this.history[0]?.role === "model") {
+            this.history.shift();
+          }
+        }
+        log("[History Compression] Trimmed oldest history turns to fit maxHistoryChars.", {
+          remainingTurns: this.history.length,
+        });
       }
 
       // EXECUTE BeforeAgent Hook
@@ -816,6 +923,11 @@ var LlmAgent = class LlmAgent {
         }
       }
       const capabilityIds = activeCapabilities.map((c) => c.id);
+
+      // vNext Hybrid Direct Mode (Single-Loop ReAct: 6 LLM calls -> 2 LLM calls)
+      if (this._shouldUseDirectMode(activeCapabilities)) {
+        return this._runDirectMode(prompt, globalInstruction, activeCapabilities, log, logCallback);
+      }
 
       // Unified Schema Definitions
       const taskArraySchema = {
@@ -875,15 +987,26 @@ Instructions:
 3. SUB-AGENT PROMPT STYLING (CRITICAL): Delegate to 'MCP Server' or 'A2A Server' using natural language queries, not robotic instructions.
 4. ONE-PASS FAST-TRACK (CRITICAL): If NO capabilities are required to answer the prompt entirely, set "requires_capabilities" to false, and write your complete response in "direct_answer". You MUST append "\n\nExecution Summary: NO capabilities were used." at the end of "direct_answer". Leave "plan" empty.
 5. BAN ON SYNTHESIS TASKS (CRITICAL): Do NOT create tasks for compiling, summarizing, formatting, or synthesizing the final answer. The system automatically executes a final synthesis phase using all gathered data. Create tasks ONLY for actively executing tools or fetching data.
+6. CONSOLIDATE SAME-SERVER MCP CALLS (CRITICAL): Do NOT split related requests or list-size/pagination parameters targeting the SAME 'MCP Server' capability into multiple repeated identical tasks. Consolidate them into a SINGLE task targeting that 'MCP Server' unless strictly distinct phases are required.
 `;
 
       log("Planning phase initiated.");
+      const isThinkingLevelModel = /(?:^|\/)gemini-[34](?:[-.]|$)/i.test(this.model);
+      const plannerGenConfig = this.generateContentConfig
+        ? { ...this.generateContentConfig }
+        : {};
+      if (isThinkingLevelModel && !plannerGenConfig.thinkingConfig) {
+        plannerGenConfig.thinkingConfig = { thinkingLevel: "LOW" };
+      }
       const plannerConfig = {
         apiKey: this.apiKey,
         model: this.model,
         history: this.history,
         systemInstruction: { parts: [{ text: globalInstruction }] },
         responseSchema: plannerSchema,
+        ...(Object.keys(plannerGenConfig).length > 0
+          ? { generationConfig: plannerGenConfig }
+          : {}),
       };
 
       let planResultText;
@@ -1010,6 +1133,244 @@ Instructions:
     }
   }
 
+  /**
+   * Determines whether Hybrid Direct Mode (Single-Loop ReAct) can safely execute this request.
+   * Default `executionMode: "planner"` never enters direct mode (100% backward compatible).
+   * @private
+   */
+  _shouldUseDirectMode(activeCapabilities) {
+    if (this.executionMode !== "direct" && this.executionMode !== "auto") {
+      return false;
+    }
+    if (!Array.isArray(activeCapabilities) || activeCapabilities.length === 0) {
+      return false;
+    }
+    // Avoid combining strict outputSchema with function declarations in a single turn
+    if (this.outputSchema) {
+      return false;
+    }
+    const allowedTypes = new Set(["Native Tool", "MCP Server"]);
+    return activeCapabilities.every((c) => allowedTypes.has(c.type));
+  }
+
+  /**
+   * Executes Native Tools and discovered MCP Server tools directly inside a single
+   * GeminiWithFiles ReAct loop (reducing 1-tool MCP execution from 6 -> 2 LLM calls).
+   * @private
+   */
+  _runDirectMode(prompt, globalInstruction, activeCapabilities, log, logCallback = null) {
+    log("[Direct Mode] Binding Native/MCP tools directly into single-loop ReAct executor.");
+    const boundFunctions = { params_: {} };
+    const usedNames = new Set();
+
+    const registerTool = (rawName, schemaMeta, handlerFn, metaInfo) => {
+      let safeName = String(rawName).replace(/[^a-zA-Z0-9_-]/g, "_");
+      if (usedNames.has(safeName)) {
+        safeName = `${metaInfo.capId}_${safeName}`;
+      }
+      usedNames.add(safeName);
+      boundFunctions.params_[safeName] = schemaMeta;
+      boundFunctions[safeName] = (args) => {
+        const callArgs = args && typeof args === "object" ? args : {};
+        if (
+          this.guardDestructiveMcpTools &&
+          metaInfo.annotations &&
+          (metaInfo.annotations.destructiveHint === true ||
+            metaInfo.annotations.readOnlyHint === false)
+        ) {
+          throw new Error(
+            `[Destructive Tool Guard] Execution of '${safeName}' blocked by guardDestructiveMcpTools (annotations: ${JSON.stringify(metaInfo.annotations)}).`,
+          );
+        }
+        const beforeRes = this.hookManager.execute("BeforeTool", {
+          prompt,
+          toolName: safeName,
+          capabilityId: metaInfo.capId,
+          arguments: callArgs,
+          source: metaInfo.source,
+        });
+        if (beforeRes.decision === "deny") {
+          throw new Error(
+            `Execution blocked by BeforeTool hook: ${beforeRes.reason || "Denied"}`,
+          );
+        }
+        const activeArgs =
+          beforeRes.arguments !== undefined ? beforeRes.arguments : callArgs;
+        let out = handlerFn(activeArgs);
+        let outStr = typeof out === "object" ? JSON.stringify(out) : String(out);
+        if (outStr.length > this.maxResultLength) {
+          outStr =
+            outStr.substring(0, this.maxResultLength) +
+            "\n\n...[TRUNCATED: Exceeds context limit]";
+        }
+        const afterRes = this.hookManager.execute("AfterTool", {
+          prompt,
+          toolName: safeName,
+          capabilityId: metaInfo.capId,
+          result: outStr,
+          source: metaInfo.source,
+        });
+        if (afterRes.decision === "deny" || afterRes.continue === false) {
+          return `[Interception Blocked/Redacted] ${afterRes.reason || "Hidden by hook policy."}`;
+        }
+        return afterRes.result !== undefined ? afterRes.result : outStr;
+      };
+    };
+
+    for (const activeCap of activeCapabilities) {
+      const cap = this.capabilities.find((c) => c.id === activeCap.id);
+      if (!cap) continue;
+      if (cap.type === "Native Tool") {
+        const nativeDesc =
+          typeof cap.description === "string"
+            ? cap.description
+            : cap.description?.description || cap._tool?.description || "";
+        const nativeParams = cap._tool?.parameters || cap.parameters;
+        const nativeFn = cap._tool?.function || cap._tool?.func || cap.func;
+        if (typeof nativeFn !== "function") {
+          throw new Error(
+            `Native Tool '${cap.name}' is missing executable 'function' handler.`,
+          );
+        }
+        registerTool(
+          cap.name,
+          {
+            description: nativeDesc,
+            parameters: nativeParams,
+          },
+          (args) => nativeFn(args),
+          { capId: cap.id, source: "native_tool", annotations: null },
+        );
+      } else if (cap.type === "MCP Server") {
+        const mcpConfig = { model: this.model };
+        if (this.logSpreadsheetId) {
+          mcpConfig.log = true;
+          mcpConfig.spreadsheetId = this.logSpreadsheetId;
+        }
+        const mcpApp = new MCPApp(mcpConfig).setServices(this.services);
+        const clientOpts = {
+          apiKey: this.apiKey,
+          prompt,
+          mcpServerUrls: [cap.URL],
+          batchProcess: true,
+          history: [],
+          ...(cap._cachedMcpServerObj
+            ? { cachedMcpServerObj: [cap._cachedMcpServerObj] }
+            : {}),
+        };
+        const tempClient = mcpApp.client(clientOpts);
+        const mcpFuncs = tempClient.functions || { params_: {} };
+        Object.keys(mcpFuncs.params_ || {}).forEach((toolKey) => {
+          if (toolKey === "without_function" || toolKey === "check_process") {
+            return;
+          }
+          if (typeof mcpFuncs[toolKey] !== "function") return;
+          const meta = mcpFuncs.params_[toolKey];
+          registerTool(
+            toolKey,
+            {
+              description: meta.description || "",
+              parameters: meta.parameters,
+            },
+            (args) => mcpFuncs[toolKey](args),
+            {
+              capId: cap.id,
+              source: "mcp_server",
+              annotations: meta.annotations || null,
+            },
+          );
+        });
+      }
+    }
+
+    const directGenConfig = this.generateContentConfig
+      ? { ...this.generateContentConfig }
+      : {};
+    if (
+      /(?:^|\/)gemini-4(?:[-.]|$)/i.test(this.model) &&
+      !directGenConfig.thinkingConfig
+    ) {
+      directGenConfig.thinkingConfig = { thinkingLevel: "LOW" };
+    }
+
+    const directConfig = {
+      apiKey: this.apiKey,
+      model: this.model,
+      functions: boundFunctions,
+      history: [...this.history],
+      systemInstruction: { parts: [{ text: globalInstruction }] },
+      ...(Object.keys(directGenConfig).length > 0
+        ? { generationConfig: directGenConfig }
+        : {}),
+    };
+
+    const answer = this._generateContent(directConfig, prompt);
+    log("[Direct Mode] Execution complete.");
+
+    const afterAgentRes = this.hookManager.execute("AfterAgent", {
+      finalAnswer: answer,
+      prompt_response: answer,
+      prompt,
+      stop_hook_active: false,
+    });
+    const finalAnswer =
+      afterAgentRes.prompt_response || afterAgentRes.finalAnswer || answer;
+
+    if (afterAgentRes.clearContext === true) {
+      this.history = [];
+    }
+    this.history.push({ role: "user", parts: [{ text: prompt }] });
+    this.history.push({
+      role: "model",
+      parts: [
+        {
+          text:
+            typeof finalAnswer === "string"
+              ? finalAnswer
+              : JSON.stringify(finalAnswer),
+        },
+      ],
+    });
+
+    this.hookManager.execute("SessionEnd", {
+      finalAnswer,
+      error: null,
+      prompt,
+      reason: "exit",
+    });
+    return finalAnswer;
+  }
+
+  _getUtf8ByteLength_(str) {
+    if (typeof Utilities !== "undefined" && typeof Utilities.newBlob === "function") {
+      return Utilities.newBlob(str, "application/json").getBytes().length;
+    }
+    if (typeof Buffer !== "undefined") {
+      return Buffer.byteLength(str, "utf8");
+    }
+    return str.length * 3;
+  }
+
+  deleteState(sessionId) {
+    if (!this.services || !this.services.properties) return;
+    const props = this.services.properties;
+    const metaKey = "HITL_STATE_" + sessionId;
+    const existing = props.getProperty(metaKey);
+    if (existing) {
+      try {
+        const parsed = JSON.parse(existing);
+        if (parsed && parsed._chunked && Number(parsed.chunks) > 0) {
+          for (let i = 0; i < parsed.chunks; i++) {
+            props.deleteProperty(`${metaKey}_${i}`);
+          }
+        }
+      } catch (e) {
+        // Ignore parse error on non-meta legacy values
+      }
+      props.deleteProperty(metaKey);
+    }
+  }
+
   saveState() {
     const stateData = {
       sessionId: this.sessionId,
@@ -1021,10 +1382,55 @@ Instructions:
       taskResults: this.taskResults || [],
       highestTaskId: this.highestTaskId || 0,
       replanCount: this.replanCount || 0,
-      suspendedTask: this.suspendedTask || null
+      suspendedTask: this.suspendedTask || null,
     };
     if (this.services && this.services.properties) {
-      this.services.properties.setProperty("HITL_STATE_" + this.sessionId, JSON.stringify(stateData));
+      const props = this.services.properties;
+      const metaKey = "HITL_STATE_" + this.sessionId;
+      const jsonStr = JSON.stringify(stateData);
+      const byteLen = this._getUtf8ByteLength_(jsonStr);
+      const MAX_PROP_BYTES = 8000; // Safe margin under GAS 9KB (9,216 byte) limit
+
+      // Clean any prior chunks before writing
+      this.deleteState(this.sessionId);
+
+      if (byteLen <= MAX_PROP_BYTES) {
+        props.setProperty(metaKey, jsonStr);
+      } else {
+        let encoded = jsonStr;
+        let compressed = false;
+        if (
+          typeof Utilities !== "undefined" &&
+          typeof Utilities.gzip === "function" &&
+          typeof Utilities.base64Encode === "function"
+        ) {
+          const gzBlob = Utilities.gzip(
+            Utilities.newBlob(jsonStr, "application/json", "state.json"),
+          );
+          encoded = Utilities.base64Encode(gzBlob.getBytes());
+          compressed = true;
+        }
+        const chunkSize = 7500;
+        const chunks = [];
+        for (let i = 0; i < encoded.length; i += chunkSize) {
+          chunks.push(encoded.slice(i, i + chunkSize));
+        }
+        const batch = {};
+        chunks.forEach((c, idx) => {
+          batch[`${metaKey}_${idx}`] = c;
+        });
+        batch[metaKey] = JSON.stringify({
+          _chunked: true,
+          compressed,
+          chunks: chunks.length,
+          savedAt: new Date().toISOString(),
+        });
+        if (typeof props.setProperties === "function") {
+          props.setProperties(batch, false);
+        } else {
+          Object.entries(batch).forEach(([k, v]) => props.setProperty(k, v));
+        }
+      }
     }
     return stateData;
   }
@@ -1032,9 +1438,35 @@ Instructions:
   loadState(sessionId) {
     let stateData = null;
     if (this.services && this.services.properties) {
-      const dataStr = this.services.properties.getProperty("HITL_STATE_" + sessionId);
+      const props = this.services.properties;
+      const metaKey = "HITL_STATE_" + sessionId;
+      const dataStr = props.getProperty(metaKey);
       if (dataStr) {
-        stateData = JSON.parse(dataStr);
+        const parsed = JSON.parse(dataStr);
+        if (parsed && parsed._chunked && Number(parsed.chunks) > 0) {
+          let assembled = "";
+          for (let i = 0; i < parsed.chunks; i++) {
+            const part = props.getProperty(`${metaKey}_${i}`);
+            if (part === null || part === undefined) {
+              throw new Error(
+                `Corrupted chunked state for sessionId ${sessionId}: missing chunk ${i}`,
+              );
+            }
+            assembled += part;
+          }
+          if (parsed.compressed) {
+            const rawBlob = Utilities.newBlob(
+              Utilities.base64Decode(assembled),
+              "application/x-gzip",
+            );
+            const unzipped = Utilities.ungzip(rawBlob).getDataAsString("UTF-8");
+            stateData = JSON.parse(unzipped);
+          } else {
+            stateData = JSON.parse(assembled);
+          }
+        } else {
+          stateData = parsed;
+        }
       }
     }
     if (!stateData && this.sessionId === sessionId) {
@@ -1048,7 +1480,7 @@ Instructions:
         taskResults: this.taskResults,
         highestTaskId: this.highestTaskId,
         replanCount: this.replanCount,
-        suspendedTask: this.suspendedTask
+        suspendedTask: this.suspendedTask,
       };
     }
     return stateData;
@@ -1075,11 +1507,7 @@ Instructions:
       this.hookManager.sessionId = this.sessionId;
     }
 
-    const log = (message, data = null) => {
-      const entry = { timestamp: new Date().toISOString(), message, data };
-      this.logs.push(entry);
-      if (typeof logCallback === "function") logCallback(entry);
-    };
+    const log = this._createLogger(logCallback);
 
     log(`Resuming execution for session ${sessionId} with decision: ${approvalDecision}`);
 
@@ -1087,9 +1515,7 @@ Instructions:
       const susp = this.suspendedTask;
       this.suspendedTask = null;
 
-      if (this.services && this.services.properties) {
-        this.services.properties.deleteProperty("HITL_STATE_" + sessionId);
-      }
+      this.deleteState(sessionId);
 
       if (approvalDecision === "allow" || approvalDecision === "approve") {
         log(`Task [${susp.task ? susp.task.task_id : "unknown"}] approved by human. Executing...`);
@@ -1300,23 +1726,10 @@ Instructions:
   }
 
   _runRemainingQueueAndSynthesize(logCallback = null) {
-    const log = (message, data = null) => {
-      const entry = { timestamp: new Date().toISOString(), message, data };
-      this.logs.push(entry);
-      const notifyRes = this.hookManager.execute("Notification", { 
-        message, 
-        data, 
-        toolName: data?.capability_id || "",
-        notification_type: "Log",
-        details: data
-      });
-      if (notifyRes.systemMessage && typeof logCallback === "function") {
-        logCallback({ timestamp: new Date().toISOString(), message: `[Hook Notification Message] ${notifyRes.systemMessage}`, data });
-      }
-      if (typeof logCallback === "function") logCallback(entry);
-    };
+    const log = this._createLogger(logCallback);
 
     const prompt = this.currentPrompt;
+    if (!this.startTime) this.startTime = Date.now();
 
     try {
       while (this.planQueue.length > 0) {
@@ -1335,11 +1748,23 @@ Instructions:
 
         let contextStr = "";
         if (task.depends_on && task.depends_on.length > 0) {
-          const dependentResults = this.taskResults.filter(
-            (tr) => task.depends_on.includes(tr.task_id) && !tr.error,
-          );
-          if (dependentResults.length > 0)
-            contextStr = `\n\n[Context from dependent tasks]:\n${JSON.stringify(dependentResults)}`;
+          const dependentResults = this.taskResults
+            .filter((tr) => task.depends_on.includes(tr.task_id) && !tr.error)
+            .map((tr) => ({
+              task_id: tr.task_id,
+              capability_used: tr.capability_used,
+              result: tr.result,
+            }));
+          if (dependentResults.length > 0) {
+            let serializedDeps = JSON.stringify(dependentResults);
+            const maxDepLen = Math.min(this.maxResultLength, 8000);
+            if (serializedDeps.length > maxDepLen) {
+              serializedDeps =
+                serializedDeps.substring(0, maxDepLen) +
+                "...[TRUNCATED: Dependent context exceeded limit]";
+            }
+            contextStr = `\n\n[Context from dependent tasks]:\n${serializedDeps}`;
+          }
         }
 
         const finalExecutionPrompt = task.execution_prompt + contextStr;
@@ -1376,6 +1801,11 @@ Instructions:
           const activeExecutionPrompt = beforeToolRes.executionPrompt || finalExecutionPrompt;
 
           while (retries >= 0) {
+            const innerElapsed = Date.now() - this.startTime;
+            if (innerElapsed > this.timeoutMs) {
+              taskError = `Execution aborted by timeout safeguard (${innerElapsed}ms > ${this.timeoutMs}ms).`;
+              break;
+            }
             try {
               rawResultData = this._executeTask(cap, activeExecutionPrompt, task);
               if (this.suspendedTask) {
@@ -1387,11 +1817,13 @@ Instructions:
               if (err.message && err.message.startsWith("SUSPENDED")) {
                 throw err;
               }
-              if (retries === 0) {
-                taskError = err.message;
+              const errMsg = err?.message || String(err);
+              if (retries <= 0) {
+                taskError = errMsg;
+                break;
               } else {
-                log(`Task [${task.task_id}] failed, retrying...`, {
-                  error: err.message,
+                log(`Task [${task.task_id}] failed, retrying... Error: ${errMsg}`, {
+                  error: errMsg,
                 });
                 Utilities.sleep(2000);
                 retries--;
@@ -1461,7 +1893,7 @@ Instructions:
             error: taskError,
             duration_ms: durationMs,
           });
-          log(`Task [${task.task_id}] failed definitively in ${durationMs}ms.`, {
+          log(`Task [${task.task_id}] failed definitively in ${durationMs}ms. Error: ${taskError}`, {
             error: taskError,
           });
 

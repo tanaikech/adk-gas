@@ -885,13 +885,45 @@ function approveSession(sessionId) {
 
 ### 📊 API Quota Safeguards & Token Accumulation (v2.0.0+)
 
-To prevent runaway loops or budget overrun, GASADK automatically tracks token usage per session. You can enforce a strict token limit using the `maxTokensPerSession` option.
+To prevent runaway loops or budget overrun, GASADK automatically tracks token usage per session (including multi-turn and thinking tokens in v2.1.0+). You can enforce a strict token limit using the `maxTokensPerSession` option.
 
 ```javascript
 const agent = new LlmAgent({
   apiKey: API_KEY,
   maxTokensPerSession: 50000 // Limit session to 50k tokens
 });
+```
+
+### 🚀 Gemini 4 Hydrogen, Hybrid Direct Mode & Official Google Workspace MCP (v2.1.0+)
+
+GASADK v2.1.0 upgrades the default model across all bundled libraries to **`models/gemini-4-hydrogen`** while maintaining 100% backward compatibility with existing v2.0.0 scripts:
+
+- **Gemini 4 Native Compatibility**: Automatic `thinkingConfig` guards (`thinkingLevel` normalization, stripping unsupported `thinkingBudget` and HTTP-400-prone sampling parameters), strict `role: "user"` for `functionResponse` turns, `thoughtSignature` preservation, `!part.thought` filtering, and multi-turn cumulative token telemetry.
+- **Hybrid Direct Mode (`executionMode: "direct" | "auto" | "planner"`)**: Opt-in single-loop ReAct execution that binds Native Tools and MCP tools directly into `GeminiWithFiles` (cutting 1-tool MCP execution from 6 LLM calls down to 2). Default remains `"planner"` for full backward compatibility.
+- **Official Google Workspace MCP Preset**: Connect to official Google Workspace MCP servers (`drive`, `gmail`, `docs`, `sheets`, `slides`, `calendar`, `chat`) in one line via `LlmAgent.createWorkspaceMcpServers()`.
+- **Compressed & Chunked HITL Persistence**: `saveState()` / `loadState()` / `deleteState()` automatically compress (`Utilities.gzip`) and chunk states exceeding GAS's 9KB `PropertiesService` limit.
+- **Inline Function Hooks**: `GasHookManager` now supports inline `type: "function"` (`handler`) hooks in addition to `gas_function`, `webhook`, and `command`.
+
+```javascript
+function exampleWorkspaceMcpDirectMode() {
+  const { LlmAgent } = GASADK;
+  const props = PropertiesService.getScriptProperties();
+
+  const agent = new LlmAgent({
+    apiKey: props.getProperty("GEMINI_API_KEY"),
+    name: "WorkspaceAssistant",
+    // Default model is now "models/gemini-4-hydrogen"
+    executionMode: "direct", // Optional: 6 -> 2 LLM calls for Native/MCP tools
+    guardDestructiveMcpTools: true, // Optional: block tools with destructiveHint/readOnlyHint=false
+    mcpServers: LlmAgent.createWorkspaceMcpServers(["drive"], { mode: "v1" }),
+  }).setServices({
+    lock: LockService.getScriptLock(),
+    properties: props,
+  });
+
+  const response = agent.run("List the 5 most recent files from Google Drive.");
+  console.log(response);
+}
 ```
 
 ## Author
@@ -960,5 +992,23 @@ const agent = new LlmAgent({
   - **Synchronized `src/lib/` Core Libraries**: Upgraded bundled core components (`GeminiWithFiles.js`, `A2AApp.js`, `MCPApp.js`, `MCPA2Aserver.js`, and `FileSearchApp.js`) to support the `GasHookManager` hooks system natively (allowing interceptors like `BeforeModel`, `AfterModel`, `BeforeTool`, and `AfterTool`).
   - **Ecosystem Modernization**: Upgraded default model configurations to `models/gemini-3.1-flash-lite` across all workspace libraries, tests, and examples to provide modern, cost-effective defaults.
   - **Modular Standalone Twin Synchronization**: Propagated and fully published these updates to all five standalone local repositories (`GeminiWithFiles_GAS_lib`, `A2AApp_GAS_lib`, `MCPApp_GAS_lib`, `MCPA2Aserver_GAS_lib`, `FileSearchApp_GAS_lib`) with next-version tags.
+
+- v2.1.0 (November 26, 2026)
+  - **Default Model Upgrade to `models/gemini-4-hydrogen`**: Unified default model across `LlmAgent`, `GeminiWithFiles`, `MCPApp`, `A2AApp`, `MCPA2Aserver`, and `FileSearch`.
+  - **Gemini 4 & Gemini 3 Native Guards (`GeminiWithFiles.js`, `A2AApp.js`, `FileSearchApp.js`, `LlmAgent.js`, `MCPApp.js`)**:
+    - Enforced `role: "user"` for `functionResponse` turns (resolving Gemini 4 HTTP 400 `Role 'function' is not supported`).
+    - Added automatic `isGemini4` `thinkingConfig` deep-clone/normalization (stripping `thinkingBudget`, promoting `"MINIMAL"` to `"LOW"`, stripping `frequencyPenalty`/`presencePenalty`/`candidateCount`), plus automatic `thinkingLevel: "LOW"` for Planner and `MCPApp` orchestrator/executor on Gemini 3 & Gemini 4 models to prevent thinking timeouts.
+    - Upgraded `_sanitizeToolParameters()` to a strict Gemini `Schema` protobuf whitelist (eliminating HTTP 400 errors from vendor/OpenAPI extensions such as `deprecated`, `x-google-enum-descriptions`, `$schema`, `additionalProperties`, `default`, and empty `properties: {}`).
+    - Fixed parallel Function Calling empty-array return bug, filtered `part.thought === true` across all response extractors, preserved `thoughtSignature` in `A2AApp` history, accumulated multi-turn tokens (`thoughtsTokenCount` + `llmCallCount`), and wired `responseJsonSchema` + opt-in `useParametersJsonSchema`.
+  - **Official Google Workspace MCP & Streamable HTTP Support (`MCPApp.js`, `LlmAgent.js`)**:
+    - Fixed `LlmAgent` retry loop infinite-loop bug (`break;` on `retries <= 0`, inner timeout safeguard, raw error visibility in `logEntry.message`).
+    - Fixed zero-argument `tools/call` sending `arguments: null` (now `{}`), canonical `mode: "ANY"`, Streamable HTTP `Accept` header & SSE (`text/event-stream`) decoding, `Mcp-Session-Id` / `MCP-Protocol-Version` (`>= 2025-06-18`) handling, `nextCursor` pagination, `ToolAnnotations` (`readOnlyHint`/`destructiveHint`) preservation, and acceptance of valid JSON-RPC `result` payloads returned with partial-scope HTTP 403 from Google Workspace MCP servers.
+    - Propagated `MCPApp.callMCPServers()` internal `totalTokenCount` and `llmCallCount` back to `LlmAgent` for accurate `maxTokensPerSession` enforcement, prevented `check_process` premature halting on normal tool steps, consolidated same-server MCP tasks in Planner, and capped serialized `dependentResults` context at 8,000 chars.
+    - Added `LlmAgent.createWorkspaceMcpServers()` helper for official Google Workspace MCP servers (`drive`, `gmail`, `docs`, `sheets`, `slides`, `calendar`, `chat`; `v1` / `v1self`).
+  - **Hybrid Direct Mode & GAS Storage Hardening (`LlmAgent.js`, `GasHookManager.js`, `A2AApp.js`, `MCPA2Aserver.js`)**:
+    - Added opt-in `executionMode: "direct" | "auto" | "planner"` (default `"planner"`, achieving ~3.5x–3.9x speedup on Google Drive MCP by cutting 5–6 LLM calls down to 2), `guardDestructiveMcpTools`, `maxHistoryChars` sliding-window `PreCompress` trimming, and MCP handshake caching (`_cachedMcpServerObj`).
+    - Upgraded `saveState()` / `loadState()` with UTF-8 byte-length detection, `Utilities.gzip` compression, 8KB chunking, and `deleteState()` cleanup to prevent GAS 9KB `PropertiesService` crashes.
+    - Added inline `type: "function"` hook support and empty-hooks fast-path in `GasHookManager.js`, narrowed `A2AApp.js` `ScriptLock` to sheet writes only, added `resources/read`/`prompts/get`/`ping`/`SendMessage`/`GetTask` routes to `MCPA2Aserver.js`, and fixed `FileSearchApp.js` `convMimeType_` and `_pollOperation` bounds.
+  - **Single-Function E2E Test Suite**: Added `tests/Test_GASADK_vNext_E2E.js` (`runAllGasadkVNextTests()`) with 270s soft time-budget protection and guaranteed `finally` cleanup of temporary Google Drive folders/files, Properties, and Cache entries (verified 10/10 PASS on live GAS runtime).
 
 [TOP](#gasadk-agent-development-kit-for-google-apps-script)

@@ -193,7 +193,13 @@ var GasHookManager = class GasHookManager {
    * @private
    */
   _executeSingleHook(hook, input) {
-    if (hook.type === 'gas_function') {
+    if (hook.type === 'function' || typeof hook.handler === 'function') {
+      const fn = hook.handler || hook.function;
+      if (typeof fn !== 'function') {
+        throw new Error(`CRITICAL: Inline function hook '${hook.name}' is missing a callable 'handler' or 'function'.`);
+      }
+      return fn(input);
+    } else if (hook.type === 'gas_function') {
       const func = this._resolveGlobalFunction(hook.functionName);
       if (!func) {
         throw new Error(`CRITICAL: Global function '${hook.functionName}' for hook '${hook.name}' was not found in the global scope.`);
@@ -336,6 +342,10 @@ var GasHookManager = class GasHookManager {
    * @returns {Object} The aggregated output/result of hook execution.
    */
   execute(event, initialInput) {
+    if (!this.hooks || this.hooks.length === 0) {
+      return initialInput || {};
+    }
+
     // Construct normalized Gemini CLI payload containing the mandatory common properties
     const input = {
       session_id: initialInput.session_id || this.sessionId,

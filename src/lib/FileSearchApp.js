@@ -42,11 +42,11 @@ var FileSearch = class FileSearch {
   /**
    * @param {object} params - The parameters.
    * @param {string} params.apiKey - The Gemini API key.
-   * @param {string} [params.model="models/gemini-3.1-flash-lite"] - The Gemini model name.
+   * @param {string} [params.model="models/gemini-4-hydrogen"] - The Gemini model name.
    */
   constructor({
     apiKey,
-    model = "models/gemini-3.1-flash-lite" /** or models/gemini-2.5-pro */,
+    model = "models/gemini-4-hydrogen" /** or models/gemini-2.5-pro */,
   }) {
     if (!apiKey) {
       throw new Error("API key is required.");
@@ -332,10 +332,10 @@ var FileSearch = class FileSearch {
       "text/yaml",
     ];
 
-    const convMimeType_ = (fileBlob) => {
-      if (!supportedMimeTypes.includes(fileBlob.getContentType())) {
+    const convMimeType_ = (fileBlob, targetFileId = null) => {
+      if (!supportedMimeTypes.includes(fileBlob.getContentType()) && targetFileId) {
         return UrlFetchApp.fetch(
-          `https://drive.google.com/thumbnail?sz=w1000&id=${fileId}`,
+          `https://drive.google.com/thumbnail?sz=w1000&id=${targetFileId}`,
           { headers: { authorization: "Bearer " + ScriptApp.getOAuthToken() } },
         ).getBlob();
       }
@@ -371,7 +371,7 @@ var FileSearch = class FileSearch {
           JSON.stringify(metadata),
           "application/json",
         ),
-        file: convMimeType_(fileBlob),
+        file: convMimeType_(fileBlob, fileId),
       };
       const endpoint = `/${fileSearchStoreName}:uploadToFileSearchStore`;
       const operation = this._request(
@@ -540,7 +540,11 @@ var FileSearch = class FileSearch {
       method: "post",
       payload: JSON.stringify(payload),
     });
-    return response.candidates[0].content.parts.find((p) => p.text).text;
+    const parts = response?.candidates?.[0]?.content?.parts || [];
+    return parts
+      .filter((p) => p && typeof p.text === "string" && !p.thought)
+      .map((p) => p.text)
+      .join("");
   }
 
   // --- Private Helper Methods ---
@@ -548,11 +552,18 @@ var FileSearch = class FileSearch {
   /**
    * Polls a long-running operation until it's complete.
    * @param {object} operation - The initial operation object.
+   * @param {number} [maxAttempts=30] - Maximum poll attempts to prevent infinite loops.
    * @returns {object} The completed operation object.
    */
-  _pollOperation(operation) {
+  _pollOperation(operation, maxAttempts = 30) {
     let currentOperation = operation;
-    while (!currentOperation.done) {
+    let attempts = 0;
+    while (currentOperation && !currentOperation.done) {
+      if (++attempts > maxAttempts) {
+        throw new Error(
+          `[FileSearch Error] Operation polling timed out after ${maxAttempts} attempts: ${currentOperation.name}`,
+        );
+      }
       Utilities.sleep(1500); // Wait before polling again
       const endpoint = `/${currentOperation.name}`;
       currentOperation = this._request(endpoint);
