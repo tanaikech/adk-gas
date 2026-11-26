@@ -51,12 +51,12 @@ At the core of GASADK is the **LlmAgent**, powered by the **Planner-Executor-Syn
 
 ---
 
-## ⚙️ GASADK Workflow Architecture
+## ⚙️ GASADK Workflow Architecture (v2.1.0)
 
-The execution lifecycle of `LlmAgent` is rigorously compartmentalized. The diagram below details the exact chronological flow from the moment `agent.run()` is invoked to the final synthesized response.
+The execution lifecycle of `LlmAgent` is rigorously compartmentalized to survive Google Apps Script's 6-minute limit and 9KB `PropertiesService` cap. The diagram below reflects **GASADK v2.1.0**, including the Hooks lifecycle, **Hybrid Direct Mode**, **Official Google Workspace MCP** integration with handshake caching, **HITL `suspend`/`resume`** with compressed chunked state persistence, and cumulative token quota safeguards.
 
 ```mermaid
-graph TD
+flowchart TD
     %% Styling Definitions
     classDef userReq fill:#f9f,stroke:#333,stroke-width:2px,color:#000;
     classDef core fill:#bbf,stroke:#333,stroke-width:2px,color:#000;
@@ -64,96 +64,118 @@ graph TD
     classDef external fill:#bfb,stroke:#333,stroke-width:2px,color:#000;
     classDef decision fill:#ff9,stroke:#333,stroke-width:2px,color:#000;
     classDef safeguard fill:#f66,stroke:#333,stroke-width:2px,color:#000;
+    classDef hook fill:#d5f5e3,stroke:#1e8449,stroke-width:2px,color:#000;
 
-    %% Nodes
+    %% Entry & Initialization
     Start(["User: agent.run(prompt)"])
-    InitCaps["Initialize Capabilities<br>(Tools, MCP, A2A, Skills)"]
-    InjectTime["Inject Temporal Context<br>System Time Anchor"]
-    Planner["LLM: Planner Phase<br>Generate DAG & JSON Schema"]
+    PreHooks["Hooks: SessionStart -> PreCompress (maxHistoryChars) -> BeforeAgent"]
+    InitCaps["Initialize & Cache Capabilities<br/>(Native Tools, MCP Cache, A2A Cards, Skills)"]
+    ToolSelHook["Hook: BeforeToolSelection<br/>(Filter / Whitelist Capabilities)"]
 
-    FastTrackDec{"requires_<br>capabilities<br>== false?"}
-    SchemaDec{"outputSchema<br>defined?"}
-    ReturnDirect(["Return direct_answer<br>Execution Bypassed"])
+    %% External Ecosystems
+    WorkspaceMCP[("Google Workspace MCP<br/>& Custom MCP Servers")]
+    A2A_Registry[("A2A Servers / Cards")]
+    GDrive[("Google Drive Skills")]
+    PropStore[("PropertiesService<br/>gzip + 8KB Chunks")]
 
+    %% Mode Branch (v2.1.0)
+    DirectDec{"executionMode ==<br/>direct / auto<br/>(Native/MCP only)?"}
+    DirectReAct["Hybrid Direct Mode (Single-Loop ReAct)<br/>Gemini 4 Hydrogen (2 LLM Calls)<br/>BeforeTool / AfterTool / guardDestructiveMcpTools"]
+
+    %% Planner Path (Default)
+    Planner["LLM: Planner Phase (thinkingLevel: LOW)<br/>Temporal Anchor + Same-Server MCP Consolidation"]
+    FastTrackDec{"requires_capabilities<br/>== false?"}
+    SchemaDec{"outputSchema<br/>defined?"}
+    ReturnDirect(["Return direct_answer<br/>Execution Bypassed"])
+
+    %% DAG Execution Loop
     PopTask["Pop Task from planQueue"]
-    CheckTime{"Elapsed Time ><br>timeoutMs<br>(280s)?"}
-    TimeoutAbort["Trigger Safe Abort<br>Stop Queue"]
+    CheckTime{"Elapsed > timeoutMs<br/>(280s) or Token Quota<br/>Exceeded?"}
+    TimeoutAbort["Safe Abort -> Partial Synthesis"]
+    InjectContext["Inject Capped dependentResults<br/>(Max 8,000 chars)"]
 
-    InjectContext["Inject 'depends_on'<br>Context to Prompt"]
-    ExecRouter{"Capability<br>Type?"}
+    %% HITL & BeforeTool
+    BeforeTool["Hook: BeforeTool<br/>(allow / deny / suspend)"]
+    HitlSuspend["saveState() (gzip + 8KB Chunks)<br/>Throw SUSPENDED"]
+    HitlResume(["User: agent.resume(sessionId, decision)<br/>loadState() -> deleteState()"])
 
-    ExecMCP["MCP Server Client"]
-    ExecA2A["A2A Server Client"]
+    %% Capability Router & Retry Guard
+    ExecRouter{"Capability Type?"}
+    ExecMCP["MCP Server Client<br/>(Cached Handshake, SSE, 403-JSON,<br/>Strict Schema Whitelist, Token Telemetry)"]
+    ExecA2A["A2A Server Client<br/>(Direct RPC, thoughtSignature)"]
     ExecSkill["Agent Skill LLM Call"]
-    ExecNative["Native Function Calling"]
+    ExecNative["Native / Built-in Tools"]
 
-    CheckErr{"Execution<br>Error?"}
-    Truncate["Payload Truncation<br>> maxResultLength"]
+    CheckErr{"Execution Error?<br/>(Bounded Retry + Inner Timeout)"}
+    Truncate["Payload Truncation & Hook: AfterTool"]
     SaveResult["Save to taskResults"]
+    CheckEmpty{"planQueue Empty?"}
+    CheckReplan{"replanCount < maxReplans?"}
+    DropQueue["Discard Remaining Queue"]
+    Replanner["LLM: Dynamic Re-Planner"]
 
-    CheckEmpty{"planQueue<br>Empty?"}
-    CheckReplan{"replanCount <<br>maxReplans?"}
-    DropQueue["Discard Remaining DAG"]
-    Replanner["LLM: Dynamic Re-Planner<br>Avoid Failed Method"]
-
-    SynthPhase["LLM: Final Synthesis<br>Analyze Gathered Data"]
+    %% Synthesis & Post Hooks
+    SynthPhase["LLM: Final Synthesis<br/>(models/gemini-4-hydrogen, !part.thought)"]
+    PostHooks["Hooks: AfterAgent -> SessionEnd<br/>Update Clean Chat History"]
     End(["Return Final Answer"])
 
-    A2A_Registry[("A2A App")]
-    MCP_Servers[("MCP Servers")]
-    GDrive[("Google Drive")]
-
-    %% Edges
-    Start --> InitCaps
+    %% Flow Connections
+    Start --> PreHooks --> InitCaps --> ToolSelHook --> DirectDec
+    InitCaps -. "tools/list + Cache" .-> WorkspaceMCP
     InitCaps -. "Fetch Agent Cards" .-> A2A_Registry
-    InitCaps -. "tools/list Request" .-> MCP_Servers
-    InitCaps -. "Read .md Skills" .-> GDrive
+    InitCaps -. "Read SKILL.md" .-> GDrive
 
-    InitCaps --> InjectTime --> Planner
-    Planner --> FastTrackDec
+    %% Direct Mode Branch
+    DirectDec -- "Yes" --> DirectReAct
+    DirectReAct -. "tools/call" .-> WorkspaceMCP
+    DirectReAct --> PostHooks
 
+    %% Planner Branch
+    DirectDec -- "No (Default: planner)" --> Planner --> FastTrackDec
     FastTrackDec -- "Yes (Fast-Track)" --> SchemaDec
-    SchemaDec -- "No (Raw output fine)" --> ReturnDirect
+    SchemaDec -- "No" --> ReturnDirect --> PostHooks
     SchemaDec -- "Yes (Intercept)" --> SynthPhase
 
-    FastTrackDec -- "No (Capabilities required)" --> PopTask
+    FastTrackDec -- "No" --> PopTask --> CheckTime
+    CheckTime -- "Exceeded" --> TimeoutAbort --> SynthPhase
+    CheckTime -- "Safe" --> InjectContext --> BeforeTool
 
-    PopTask --> CheckTime
-    CheckTime -- "Timeout Exceeded" --> TimeoutAbort
-    TimeoutAbort --> SynthPhase
-
-    CheckTime -- "Safe" --> InjectContext
-    InjectContext --> ExecRouter
+    BeforeTool -- "suspend (HITL)" --> HitlSuspend -. "Persist" .-> PropStore
+    PropStore -. "Restore" .-> HitlResume --> PopTask
+    BeforeTool -- "deny" --> CheckReplan
+    BeforeTool -- "allow" --> ExecRouter
 
     ExecRouter -- "MCP Server" --> ExecMCP
     ExecRouter -- "A2A Server" --> ExecA2A
     ExecRouter -- "Agent Skill" --> ExecSkill
     ExecRouter -- "Native/Built-in" --> ExecNative
 
+    ExecMCP -. "tools/call" .-> WorkspaceMCP
+    ExecA2A -. "JSON-RPC" .-> A2A_Registry
+
     ExecMCP --> CheckErr
     ExecA2A --> CheckErr
     ExecSkill --> CheckErr
     ExecNative --> CheckErr
 
-    CheckErr -- "Success" --> Truncate --> SaveResult
-    SaveResult --> CheckEmpty
+    CheckErr -- "Success" --> Truncate --> SaveResult --> CheckEmpty
     CheckEmpty -- "No" --> PopTask
     CheckEmpty -- "Yes" --> SynthPhase
 
-    CheckErr -- "Failed" --> CheckReplan
-    CheckReplan -- "Yes (Can Replan)" --> DropQueue --> Replanner
-    Replanner --> PopTask
-    CheckReplan -- "No (Max Replans)" --> SaveResult
+    CheckErr -- "Failed (Retries Exhausted)" --> CheckReplan
+    CheckReplan -- "Yes" --> DropQueue --> Replanner --> PopTask
+    CheckReplan -- "No" --> SynthPhase
 
-    SynthPhase --> End
+    SynthPhase --> PostHooks --> End
 
     %% Assign Classes
-    class Start,ReturnDirect,End userReq;
-    class InitCaps,InjectTime,PopTask,InjectContext,ExecNative,SaveResult core;
-    class Planner,ExecSkill,Replanner,SynthPhase llm;
-    class ExecMCP,ExecA2A,A2A_Registry,MCP_Servers,GDrive external;
-    class FastTrackDec,SchemaDec,CheckTime,ExecRouter,CheckErr,CheckEmpty,CheckReplan decision;
-    class TimeoutAbort,Truncate,DropQueue safeguard;
+    class Start,ReturnDirect,End,HitlResume userReq;
+    class InitCaps,PopTask,InjectContext,ExecNative,SaveResult core;
+    class Planner,DirectReAct,ExecSkill,Replanner,SynthPhase llm;
+    class ExecMCP,ExecA2A,WorkspaceMCP,A2A_Registry,GDrive,PropStore external;
+    class DirectDec,FastTrackDec,SchemaDec,CheckTime,ExecRouter,CheckErr,CheckEmpty,CheckReplan decision;
+    class TimeoutAbort,Truncate,DropQueue,HitlSuspend safeguard;
+    class PreHooks,ToolSelHook,BeforeTool,PostHooks hook;
 ```
 
 ---
