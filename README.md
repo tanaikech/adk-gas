@@ -185,11 +185,11 @@ flowchart TD
 GASADK acts as a universal adapter, normalizing disparate protocols into a unified schema for the Planner.
 
 - **Native Tools**: Wrap standard Google Apps Script functions directly into the capability schema.
-- **MCP Servers**: Native integration to dynamically discover (`tools/list`) and invoke tools on external servers using the Model Context Protocol.
+- **MCP Servers**: Native integration to dynamically discover (`tools/list`) and invoke tools on external servers using the Model Context Protocol — including official **Google Workspace MCP Servers** (`drivemcp.googleapis.com`, `gmailmcp.googleapis.com`, etc.) with Streamable HTTP, SSE, and `ToolAnnotations` safety guards.
 - **A2A Servers**: Cross-agent communication. Fetch remote Agent Cards and utilize other autonomous agents as local tools via the Agent-to-Agent protocol.
 - **Sub-Agents**: Nest instances of `LlmAgent` locally. Delegate complex cognitive sub-tasks without corrupting the main orchestrator's context.
 - **Agent Skills**: Dynamically load behavioral skills stored as Markdown (`.md`) files inside Google Drive. A native GAS hack for distributed, RAG-like prompt injection.
-- **Built-in Tools**: Comes equipped with a Python `CodeExecutor` and native `GoogleSearch` capabilities.
+- **Built-in Tools**: Comes equipped with Python `CodeExecutor`, native `GoogleSearch`, `UrlContext`, and `FileSearch` RAG capabilities.
 
 ---
 
@@ -199,7 +199,7 @@ GASADK integrates multiple high-performance GAS libraries under the hood. You ca
 
 GASADK is constructed by the following scripts.
 
-- [GADADK](https://github.com/tanaikech/adk-gas)
+- [GASADK](https://github.com/tanaikech/adk-gas)
 - [GeminiWithFiles](https://github.com/tanaikech/GeminiWithFiles)
 - [A2AApp](https://github.com/tanaikech/A2AApp)
 - [MCPApp](https://github.com/tanaikech/MCPApp)
@@ -222,7 +222,7 @@ const { LlmAgent, MCPA2Aserver, FileSearch } = GASADK;
 
 **All objects are the class objects.**
 
-You can also directly use `GeminiWithFiles`, `A2AApp`, and `MCPApp` like `const { LlmAgent, GeminiWithFiles, MCPA2Aserver, FileSearch, GeminiWithFiles, A2AApp, MCPApp } = GASADK`.
+You can also directly use `GeminiWithFiles`, `A2AApp`, `MCPApp`, and `GasHookManager` like `const { LlmAgent, GeminiWithFiles, MCPA2Aserver, FileSearch, A2AApp, MCPApp, GasHookManager } = GASADK;`.
 
 ### Option 2: Copy & Paste Directly
 
@@ -230,7 +230,7 @@ If you want to directly use GASADK by including all scripts in a Google Apps Scr
 
 [https://github.com/tanaikech/adk-gas/blob/master/dist/GASADK.js](https://github.com/tanaikech/adk-gas/blob/master/dist/GASADK.js)
 
-In this case, you can directly use the class objects. So, you are not required to set `const { LlmAgent, GeminiWithFiles, MCPA2Aserver, FileSearch, GeminiWithFiles, A2AApp, MCPApp } = GASADK`.
+In this case, you can directly use the class objects without destructuring `GASADK`.
 
 ---
 
@@ -243,17 +243,26 @@ The `new LlmAgent(config)` constructor accepts an extensive configuration object
 | `apiKey`                 | String        | **Yes**  | Your Gemini API Key.                                                                                                 |
 | `name`                   | String        |    No    | Internal name of the agent. Defaults to `"Agent"`.                                                                   |
 | `description`            | String        |    No    | Agent description. Critical for parent orchestrators utilizing Sub-Agents.                                           |
-| `model`                  | String        |    No    | The Gemini model. Defaults to `"models/gemini-3.1-flash-lite"`.                                                     |
+| `model`                  | String        |    No    | The Gemini model. Defaults to `"models/gemini-4-hydrogen"` (v2.1.0+).                                                |
 | `instruction`            | String/Object |    No    | Global system instruction. Supports `{var_name}` interpolation.                                                      |
 | `state`                  | Object        |    No    | Key-value mapping for dynamic state variables. Replaces `{var_name}`.                                                |
 | `tools`                  | Array         |    No    | Array of native GAS functions mapped to the tool schema.                                                             |
-| `mcpServers`             | Array         |    No    | Array of external MCP Server URLs or JSON objects (for custom server routing) for dynamic capability discovery.      |
-| `a2aServerAgentCardURLs` | Array         |    No    | Array of remote Agent Card URLs or JSON objects (for custom server routing) for A2A collaboration.                     |
-| `a2aServerAgentCardJSONs`| Array         |    No    | Array of local pre-fetched Agent Card JSON objects (supports custom name aliases) to bypass HTTP card retrieval.      |
+| `mcpServers`             | Array         |    No    | Array of external MCP Server URLs or JSON objects (including official Google Workspace MCP servers).                 |
+| `a2aServerAgentCardURLs` | Array         |    No    | Array of remote Agent Card URLs or JSON objects (for custom server routing) for A2A collaboration.                   |
+| `a2aServerAgentCardJSONs`| Array         |    No    | Array of local pre-fetched Agent Card JSON objects (supports custom name aliases) to bypass HTTP card retrieval.     |
 | `subAgents`              | Array         |    No    | Array of child `LlmAgent` instances for hierarchical delegation.                                                     |
 | `skillFolderId`          | String        |    No    | Google Drive Folder ID containing `.md` files for Agent Skills.                                                      |
 | `codeExecutor`           | Object        |    No    | Configuration object to enable Python execution Built-in capabilities.                                               |
 | `googleSearch`           | Object        |    No    | Configuration object to enable the Built-in Google Search tool.                                                      |
+| `urlContext`             | Object        |    No    | Configuration object to enable Built-in URL Context retrieval.                                                       |
+| `fileSearch`             | Object        |    No    | Configuration object to enable Built-in File Search (managed RAG).                                                   |
+| `generateContentConfig`  | Object        |    No    | Custom Gemini `generationConfig` (e.g., `thinkingConfig: { thinkingLevel: "LOW" \| "MEDIUM" \| "HIGH" \| "XHIGH" }`).|
+| `hooks`                  | Array         |    No    | Array of lifecycle hook definitions (`gas_function`, `function`, `webhook`, `command`) for `GasHookManager`.         |
+| `executionMode`          | String        |    No    | `"planner"` (default), `"direct"` (single-loop ReAct for Native/MCP, ~3.5x faster), or `"auto"` (v2.1.0+).           |
+| `guardDestructiveMcpTools` | Boolean     |    No    | When `true`, blocks MCP tools annotated with `destructiveHint: true` or `readOnlyHint: false` in Direct Mode.        |
+| `maxHistoryChars`        | Number        |    No    | Sliding-window character cap for `PreCompress` automatic history trimming. Defaults to `0` (disabled).               |
+| `useParametersJsonSchema`| Boolean       |    No    | Opt-in to emit `parametersJsonSchema` instead of sanitized OpenAPI `parameters` on `v1beta`. Defaults to `false`.    |
+| `maxTokensPerSession`    | Number        |    No    | Strict per-session token budget safeguard (includes `MCPApp` internal calls and thinking tokens).                    |
 | `maxReplans`             | Number        |    No    | Maximum dynamic Re-Plan attempts on execution failure. Defaults to `2`.                                              |
 | `timeoutMs`              | Number        |    No    | Milliseconds before triggering a forced abort to evade the GAS 6-minute kill switch. Defaults to `280000` (280s).    |
 | `maxResultLength`        | Number        |    No    | Maximum allowed string length per execution before truncation. Prevents payload crashes. Defaults to `20000`.        |
@@ -353,6 +362,12 @@ const agent = new LlmAgent({
   Retrieves the current conversation history.
 - `getAgentInf()`  
   An introspection tool that returns an array of all internally normalized capabilities (from Native tools, MCP, A2A, and Skills) bound to the agent.
+- `getLogs()`  
+  Returns the accumulated execution log entries for the current session.
+- `saveState()` / `loadState(sessionId)` / `deleteState(sessionId)` / `resume(sessionId, decision, approvedArgs, logCallback)`  
+  Human-in-the-Loop (HITL) persistence and resumption methods. In v2.1.0+, states exceeding 8KB UTF-8 are automatically gzip-compressed and chunked across `PropertiesService`, and `deleteState()` removes all chunks cleanly.
+- `LlmAgent.createWorkspaceMcpServers(services, options)` *(Static, v2.1.0+)*  
+  Builds official Google Workspace MCP Server configurations (`["drive", "gmail", "docs", "sheets", "slides", "calendar", "chat"]`) with `{ mode: "v1" | "v1self", token }`.
 
 ---
 
@@ -375,7 +390,7 @@ function test_quickstart() {
   const agent = new LlmAgent({
     apiKey: API_KEY,
     name: "HelperAgent",
-    model: "models/gemini-3.1-flash-lite",
+    model: "models/gemini-4-hydrogen",
     instruction: "You are a helpful AI assistant.",
   });
 
@@ -412,6 +427,7 @@ const { LlmAgent } = GASADK;
 function test_subagents() {
   const properties = PropertiesService.getScriptProperties();
   const API_KEY = properties.getProperty("GEMINI_API_KEY");
+  const MODEL_NAME = "models/gemini-4-hydrogen";
 
   const translator = new LlmAgent({
     apiKey: API_KEY,
@@ -449,9 +465,10 @@ Agent Skills are used.
 // Remove destructuring if you copied the scripts directly.
 const { LlmAgent } = GASADK;
 
-function test_subagents() {
+function test_agent_skills() {
   const properties = PropertiesService.getScriptProperties();
   const API_KEY = properties.getProperty("GEMINI_API_KEY");
+  const MODEL_NAME = "models/gemini-4-hydrogen";
 
   console.log("Setting up temporary Agent Skills directory...");
   const tempFolder = DriveApp.createFolder(
@@ -560,7 +577,7 @@ const WEB_APPS_URL =
 
 const object = {
   apiKey: API_KEY,
-  model: "models/gemini-3.1-flash-lite",
+  model: "models/gemini-4-hydrogen",
   accessKey: "sample",
 };
 
@@ -690,7 +707,7 @@ function test_chat_history() {
   const agent = new LlmAgent({
     apiKey: API_KEY,
     name: "ChattyAgent",
-    model: "models/gemini-3.1-flash-lite",
+    model: "models/gemini-4-hydrogen",
   }).setServices({ lock: LockService.getScriptLock(), properties: properties });
 
   // 1. Manually seed/restore conversation history
