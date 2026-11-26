@@ -821,10 +821,6 @@ function listRecentDriveFilesWithWorkspaceMcp() {
 
 ---
 
-## License
-
-[MIT](https://tanaikech.github.io/license/)
-
 ## 🛡 Hooks System & Workspace Safety Guardrails (v1.3.5+)
 
 GASADK introduces a comprehensive Hooks system fully compliant with the Gemini CLI specifications. Developers can intercept the execution lifecycle of the agent, apply validations, inject context, mock responses, or enforce safety guardrails.
@@ -1020,7 +1016,9 @@ const agent = new LlmAgent({
 });
 ```
 
-### 🚀 Gemini 4 Hydrogen, Hybrid Direct Mode & Official Google Workspace MCP (v2.1.0+)
+---
+
+## 🚀 Gemini 4 Hydrogen, Hybrid Direct Mode & Official Google Workspace MCP (v2.1.0+)
 
 GASADK v2.1.0 upgrades the default model across all bundled libraries to **`models/gemini-4-hydrogen`** while maintaining 100% backward compatibility with existing v2.0.0 scripts:
 
@@ -1051,6 +1049,14 @@ function exampleWorkspaceMcpDirectMode() {
   console.log(response);
 }
 ```
+
+---
+
+## License
+
+[MIT](https://tanaikech.github.io/license/)
+
+---
 
 ## Author
 
