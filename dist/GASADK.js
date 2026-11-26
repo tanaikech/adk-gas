@@ -193,7 +193,13 @@ var GasHookManager = class GasHookManager {
    * @private
    */
   _executeSingleHook(hook, input) {
-    if (hook.type === 'gas_function') {
+    if (hook.type === 'function' || typeof hook.handler === 'function') {
+      const fn = hook.handler || hook.function;
+      if (typeof fn !== 'function') {
+        throw new Error(`CRITICAL: Inline function hook '${hook.name}' is missing a callable 'handler' or 'function'.`);
+      }
+      return fn(input);
+    } else if (hook.type === 'gas_function') {
       const func = this._resolveGlobalFunction(hook.functionName);
       if (!func) {
         throw new Error(`CRITICAL: Global function '${hook.functionName}' for hook '${hook.name}' was not found in the global scope.`);
@@ -336,6 +342,10 @@ var GasHookManager = class GasHookManager {
    * @returns {Object} The aggregated output/result of hook execution.
    */
   execute(event, initialInput) {
+    if (!this.hooks || this.hooks.length === 0) {
+      return initialInput || {};
+    }
+
     // Construct normalized Gemini CLI payload containing the mandatory common properties
     const input = {
       session_id: initialInput.session_id || this.sessionId,
@@ -474,7 +484,7 @@ var GasHookManager = class GasHookManager {
 
 /**
  * LlmAgent.js
- * [Production Release v2.0.0] - The Ultimate Autonomous Orchestrator with Multi-Channel Logging
+ * [Production Release v2.1.0] - Gemini 4 Hydrogen Edition, Hybrid Direct Mode & Google Workspace MCP Support
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -537,7 +547,7 @@ var LlmAgent = class LlmAgent {
 
     this.name = config.name || "Agent";
     this.description = config.description || "";
-    this.model = config.model || "models/gemini-3.1-flash-lite";
+    this.model = config.model || "models/gemini-4-hydrogen";
     this.instruction = config.instruction || "";
     this.state = config.state || {};
 
@@ -546,6 +556,14 @@ var LlmAgent = class LlmAgent {
     this.timeoutMs = config.timeoutMs || 280000; // 280 seconds (GAS safe limit)
     this.maxResultLength = config.maxResultLength || 20000; // Bulletproofing threshold
     this.startTime = null;
+
+    // vNext Opt-In Modernization Controls (100% Backward-Compatible Defaults)
+    this.executionMode = config.executionMode || "planner"; // "planner" | "direct" | "auto"
+    this.parallelExecution = Boolean(config.parallelExecution);
+    this.discoveryCacheTtlSec = Number(config.discoveryCacheTtlSec || 0);
+    this.maxHistoryChars = Number(config.maxHistoryChars || 0);
+    this.guardDestructiveMcpTools = Boolean(config.guardDestructiveMcpTools);
+    this.useParametersJsonSchema = Boolean(config.useParametersJsonSchema);
 
     // Capabilities configuration
     this.tools = config.tools || [];
@@ -577,7 +595,68 @@ var LlmAgent = class LlmAgent {
     this.services = null;
     this.capabilities = [];
     this.accumulatedTokens = 0;
+    this.llmCallCount = 0;
     this._capabilitiesInitialized = false;
+  }
+
+  /**
+   * Convenience helper to build official Google Workspace MCP Server configurations.
+   * Supports: "drive", "gmail", "docs", "sheets", "slides", "calendar", "chat".
+   *
+   * @param {string[]} [services=["drive"]] - Workspace service identifiers.
+   * @param {Object} [options={}] - { mode: "v1" | "v1self", token: string }
+   * @returns {Object[]} Array compatible with `LlmAgent({ mcpServers })`.
+   */
+  static createWorkspaceMcpServers(services = ["drive"], options = {}) {
+    const endpointMap = {
+      drive: "https://drivemcp.googleapis.com/mcp",
+      gmail: "https://gmailmcp.googleapis.com/mcp",
+      docs: "https://docsmcp.googleapis.com/mcp",
+      sheets: "https://sheetsmcp.googleapis.com/mcp",
+      slides: "https://slidesmcp.googleapis.com/mcp",
+      calendar: "https://calendarmcp.googleapis.com/mcp",
+      chat: "https://chatmcp.googleapis.com/mcp",
+    };
+    const mode = options.mode === "v1self" ? "v1self" : "v1";
+    const token =
+      options.token ||
+      (typeof ScriptApp !== "undefined" ? ScriptApp.getOAuthToken() : "");
+
+    return (Array.isArray(services) ? services : [services])
+      .map((svc) => String(svc).toLowerCase().trim())
+      .filter((svc) => endpointMap[svc])
+      .map((svc) => ({
+        [`${svc}_mcp`]: {
+          httpUrl: `${endpointMap[svc]}/${mode}`,
+          headers: token ? { authorization: `Bearer ${token}` } : {},
+        },
+      }));
+  }
+
+  /**
+   * Unified logger helper with Notification hook propagation.
+   * @private
+   */
+  _createLogger(logCallback = null) {
+    return (message, data = null) => {
+      const entry = { timestamp: new Date().toISOString(), message, data };
+      this.logs.push(entry);
+      const notifyRes = this.hookManager.execute("Notification", {
+        message,
+        data,
+        toolName: data?.capability_id || "",
+        notification_type: "Log",
+        details: data,
+      });
+      if (notifyRes.systemMessage && typeof logCallback === "function") {
+        logCallback({
+          timestamp: new Date().toISOString(),
+          message: `[Hook Notification Message] ${notifyRes.systemMessage}`,
+          data,
+        });
+      }
+      if (typeof logCallback === "function") logCallback(entry);
+    };
   }
 
   /**
@@ -611,19 +690,28 @@ var LlmAgent = class LlmAgent {
       text = mockedResponse.text;
     } else {
       // Force exportTotalTokens to capture token consumption
-      const clientConfig = { ...activeConfig, exportTotalTokens: true };
+      const clientConfig = {
+        ...activeConfig,
+        exportTotalTokens: true,
+        ...(this.useParametersJsonSchema &&
+        activeConfig.useParametersJsonSchema === undefined
+          ? { useParametersJsonSchema: true }
+          : {}),
+      };
       const rawRes = new GeminiWithFiles(clientConfig).generateContent({ q: activeQuery });
       
       if (rawRes && typeof rawRes === 'object' && rawRes.returnValue !== undefined) {
         text = typeof rawRes.returnValue === 'string' ? rawRes.returnValue : JSON.stringify(rawRes.returnValue);
         const tokens = rawRes.totalTokenCount || 0;
         this.accumulatedTokens = (this.accumulatedTokens || 0) + tokens;
+        this.llmCallCount = (this.llmCallCount || 0) + (rawRes.llmCallCount || 1);
         
         // Quota Safeguard check
         if (this.maxTokensPerSession && this.accumulatedTokens > this.maxTokensPerSession) {
           throw new Error(`CRITICAL: Session aborted. Accumulated token count (${this.accumulatedTokens}) exceeded limit (${this.maxTokensPerSession}).`);
         }
       } else {
+        this.llmCallCount = (this.llmCallCount || 0) + 1;
         text = rawRes;
       }
     }
@@ -779,7 +867,7 @@ var LlmAgent = class LlmAgent {
     // 2. MCP Servers
     if (this.mcpServers?.length > 0) {
       try {
-        const mcpConfig = {};
+        const mcpConfig = { model: this.model };
         if (this.logSpreadsheetId) {
           mcpConfig.log = true;
           mcpConfig.spreadsheetId = this.logSpreadsheetId;
@@ -813,6 +901,7 @@ var LlmAgent = class LlmAgent {
             const toolDescriptions = rawTools.map((t) => ({
               name: t.name,
               description: t.description,
+              parameters: Object.keys(t.inputSchema?.properties || {}),
               required_parameters: t.inputSchema?.required || [],
             }));
 
@@ -830,6 +919,7 @@ var LlmAgent = class LlmAgent {
                 tools: toolDescriptions,
               },
               URL: originalUrlOrObj, // Kept intact for downward GASADK compat
+              _cachedMcpServerObj: obj, // Reuse handshake & tool discovery within session
             });
           });
         }
@@ -1068,7 +1158,8 @@ var LlmAgent = class LlmAgent {
           const activeArgs = beforeToolRes.hookSpecificOutput?.tool_input || beforeToolRes.tool_input || args;
           
           // Run the original function
-          let result = cap._tool.function(activeArgs);
+          const nativeHandler = cap._tool.function || cap._tool.func;
+          let result = nativeHandler(activeArgs);
           
           // 2. EXECUTE AfterTool Hook with execution result
           const afterToolRes = self.hookManager.execute("AfterTool", {
@@ -1102,20 +1193,39 @@ var LlmAgent = class LlmAgent {
         return this._generateContent(config, executionPrompt);
       }
       case "MCP Server": {
-        const mcpConfig = {};
+        const mcpConfig = { model: this.model };
         if (this.logSpreadsheetId) {
           mcpConfig.log = true;
           mcpConfig.spreadsheetId = this.logSpreadsheetId;
         }
         const mcpApp = new MCPApp(mcpConfig).setServices(this.services);
-        const tempClient = mcpApp.client({
+        if (typeof mcpApp.setHookManager === "function" && this.hookManager) {
+          mcpApp.setHookManager(this.hookManager);
+        }
+        const clientOpts = {
           apiKey: this.apiKey,
           prompt: executionPrompt,
           mcpServerUrls: [cap.URL],
           batchProcess: true,
+          skipFinalSummary: true,
           history: [...this.history],
-        });
+        };
+        if (cap._cachedMcpServerObj) {
+          clientOpts.cachedMcpServerObj = [cap._cachedMcpServerObj];
+        }
+        const tempClient = mcpApp.client(clientOpts);
         const res = tempClient.callMCPServers();
+        if (res?.totalTokenCount) {
+          this.accumulatedTokens = (this.accumulatedTokens || 0) + res.totalTokenCount;
+        }
+        if (res?.llmCallCount) {
+          this.llmCallCount = (this.llmCallCount || 0) + res.llmCallCount;
+        }
+        if (this.maxTokensPerSession && this.accumulatedTokens > this.maxTokensPerSession) {
+          throw new Error(
+            `CRITICAL: Session aborted. Accumulated token count (${this.accumulatedTokens}) exceeded limit (${this.maxTokensPerSession}).`,
+          );
+        }
         if (res?.error)
           throw new Error(`MCP Error: ${JSON.stringify(res.error)}`);
         return res?.result || res;
@@ -1209,23 +1319,7 @@ var LlmAgent = class LlmAgent {
         prompt = prompt + "\n\n[Session Start Context]:\n" + sessionContext;
       }
 
-      const log = (message, data = null) => {
-        const entry = { timestamp: new Date().toISOString(), message, data };
-        this.logs.push(entry);
-        
-        const notifyRes = this.hookManager.execute("Notification", { 
-          message, 
-          data, 
-          toolName: data?.capability_id || "",
-          notification_type: "Log",
-          details: data
-        });
-        
-        if (notifyRes.systemMessage && typeof logCallback === "function") {
-          logCallback({ timestamp: new Date().toISOString(), message: `[Hook Notification Message] ${notifyRes.systemMessage}`, data });
-        }
-        if (typeof logCallback === "function") logCallback(entry);
-      };
+      const log = this._createLogger(logCallback);
 
       if (sessionStartRes.systemMessage) {
         log(`[SessionStart Hook Message] ${sessionStartRes.systemMessage}`);
@@ -1234,10 +1328,33 @@ var LlmAgent = class LlmAgent {
       if (!this._capabilitiesInitialized) this._initializeCapabilities(log);
       log("Agent run sequence initiated", { prompt });
 
-      // EXECUTE PreCompress Hook (Standard lifecycle alignment)
-      const preCompressRes = this.hookManager.execute("PreCompress", { trigger: "auto" });
+      // EXECUTE PreCompress Hook & optional sliding-window history compression
+      const historyChars = JSON.stringify(this.history || []).length;
+      const preCompressRes = this.hookManager.execute("PreCompress", {
+        trigger: "auto",
+        historyChars,
+        maxHistoryChars: this.maxHistoryChars,
+      });
       if (preCompressRes.systemMessage) {
         log(`[PreCompress Hook Message] ${preCompressRes.systemMessage}`);
+      }
+      if (
+        this.maxHistoryChars > 0 &&
+        historyChars > this.maxHistoryChars &&
+        this.history.length > 2
+      ) {
+        while (
+          this.history.length > 2 &&
+          JSON.stringify(this.history).length > this.maxHistoryChars
+        ) {
+          this.history.shift();
+          if (this.history.length > 2 && this.history[0]?.role === "model") {
+            this.history.shift();
+          }
+        }
+        log("[History Compression] Trimmed oldest history turns to fit maxHistoryChars.", {
+          remainingTurns: this.history.length,
+        });
       }
 
       // EXECUTE BeforeAgent Hook
@@ -1290,6 +1407,11 @@ var LlmAgent = class LlmAgent {
         }
       }
       const capabilityIds = activeCapabilities.map((c) => c.id);
+
+      // vNext Hybrid Direct Mode (Single-Loop ReAct: 6 LLM calls -> 2 LLM calls)
+      if (this._shouldUseDirectMode(activeCapabilities)) {
+        return this._runDirectMode(prompt, globalInstruction, activeCapabilities, log, logCallback);
+      }
 
       // Unified Schema Definitions
       const taskArraySchema = {
@@ -1349,15 +1471,26 @@ Instructions:
 3. SUB-AGENT PROMPT STYLING (CRITICAL): Delegate to 'MCP Server' or 'A2A Server' using natural language queries, not robotic instructions.
 4. ONE-PASS FAST-TRACK (CRITICAL): If NO capabilities are required to answer the prompt entirely, set "requires_capabilities" to false, and write your complete response in "direct_answer". You MUST append "\n\nExecution Summary: NO capabilities were used." at the end of "direct_answer". Leave "plan" empty.
 5. BAN ON SYNTHESIS TASKS (CRITICAL): Do NOT create tasks for compiling, summarizing, formatting, or synthesizing the final answer. The system automatically executes a final synthesis phase using all gathered data. Create tasks ONLY for actively executing tools or fetching data.
+6. CONSOLIDATE SAME-SERVER MCP CALLS (CRITICAL): Do NOT split related requests or list-size/pagination parameters targeting the SAME 'MCP Server' capability into multiple repeated identical tasks. Consolidate them into a SINGLE task targeting that 'MCP Server' unless strictly distinct phases are required.
 `;
 
       log("Planning phase initiated.");
+      const isThinkingLevelModel = /(?:^|\/)gemini-[34](?:[-.]|$)/i.test(this.model);
+      const plannerGenConfig = this.generateContentConfig
+        ? { ...this.generateContentConfig }
+        : {};
+      if (isThinkingLevelModel && !plannerGenConfig.thinkingConfig) {
+        plannerGenConfig.thinkingConfig = { thinkingLevel: "LOW" };
+      }
       const plannerConfig = {
         apiKey: this.apiKey,
         model: this.model,
         history: this.history,
         systemInstruction: { parts: [{ text: globalInstruction }] },
         responseSchema: plannerSchema,
+        ...(Object.keys(plannerGenConfig).length > 0
+          ? { generationConfig: plannerGenConfig }
+          : {}),
       };
 
       let planResultText;
@@ -1484,6 +1617,244 @@ Instructions:
     }
   }
 
+  /**
+   * Determines whether Hybrid Direct Mode (Single-Loop ReAct) can safely execute this request.
+   * Default `executionMode: "planner"` never enters direct mode (100% backward compatible).
+   * @private
+   */
+  _shouldUseDirectMode(activeCapabilities) {
+    if (this.executionMode !== "direct" && this.executionMode !== "auto") {
+      return false;
+    }
+    if (!Array.isArray(activeCapabilities) || activeCapabilities.length === 0) {
+      return false;
+    }
+    // Avoid combining strict outputSchema with function declarations in a single turn
+    if (this.outputSchema) {
+      return false;
+    }
+    const allowedTypes = new Set(["Native Tool", "MCP Server"]);
+    return activeCapabilities.every((c) => allowedTypes.has(c.type));
+  }
+
+  /**
+   * Executes Native Tools and discovered MCP Server tools directly inside a single
+   * GeminiWithFiles ReAct loop (reducing 1-tool MCP execution from 6 -> 2 LLM calls).
+   * @private
+   */
+  _runDirectMode(prompt, globalInstruction, activeCapabilities, log, logCallback = null) {
+    log("[Direct Mode] Binding Native/MCP tools directly into single-loop ReAct executor.");
+    const boundFunctions = { params_: {} };
+    const usedNames = new Set();
+
+    const registerTool = (rawName, schemaMeta, handlerFn, metaInfo) => {
+      let safeName = String(rawName).replace(/[^a-zA-Z0-9_-]/g, "_");
+      if (usedNames.has(safeName)) {
+        safeName = `${metaInfo.capId}_${safeName}`;
+      }
+      usedNames.add(safeName);
+      boundFunctions.params_[safeName] = schemaMeta;
+      boundFunctions[safeName] = (args) => {
+        const callArgs = args && typeof args === "object" ? args : {};
+        if (
+          this.guardDestructiveMcpTools &&
+          metaInfo.annotations &&
+          (metaInfo.annotations.destructiveHint === true ||
+            metaInfo.annotations.readOnlyHint === false)
+        ) {
+          throw new Error(
+            `[Destructive Tool Guard] Execution of '${safeName}' blocked by guardDestructiveMcpTools (annotations: ${JSON.stringify(metaInfo.annotations)}).`,
+          );
+        }
+        const beforeRes = this.hookManager.execute("BeforeTool", {
+          prompt,
+          toolName: safeName,
+          capabilityId: metaInfo.capId,
+          arguments: callArgs,
+          source: metaInfo.source,
+        });
+        if (beforeRes.decision === "deny") {
+          throw new Error(
+            `Execution blocked by BeforeTool hook: ${beforeRes.reason || "Denied"}`,
+          );
+        }
+        const activeArgs =
+          beforeRes.arguments !== undefined ? beforeRes.arguments : callArgs;
+        let out = handlerFn(activeArgs);
+        let outStr = typeof out === "object" ? JSON.stringify(out) : String(out);
+        if (outStr.length > this.maxResultLength) {
+          outStr =
+            outStr.substring(0, this.maxResultLength) +
+            "\n\n...[TRUNCATED: Exceeds context limit]";
+        }
+        const afterRes = this.hookManager.execute("AfterTool", {
+          prompt,
+          toolName: safeName,
+          capabilityId: metaInfo.capId,
+          result: outStr,
+          source: metaInfo.source,
+        });
+        if (afterRes.decision === "deny" || afterRes.continue === false) {
+          return `[Interception Blocked/Redacted] ${afterRes.reason || "Hidden by hook policy."}`;
+        }
+        return afterRes.result !== undefined ? afterRes.result : outStr;
+      };
+    };
+
+    for (const activeCap of activeCapabilities) {
+      const cap = this.capabilities.find((c) => c.id === activeCap.id);
+      if (!cap) continue;
+      if (cap.type === "Native Tool") {
+        const nativeDesc =
+          typeof cap.description === "string"
+            ? cap.description
+            : cap.description?.description || cap._tool?.description || "";
+        const nativeParams = cap._tool?.parameters || cap.parameters;
+        const nativeFn = cap._tool?.function || cap._tool?.func || cap.func;
+        if (typeof nativeFn !== "function") {
+          throw new Error(
+            `Native Tool '${cap.name}' is missing executable 'function' handler.`,
+          );
+        }
+        registerTool(
+          cap.name,
+          {
+            description: nativeDesc,
+            parameters: nativeParams,
+          },
+          (args) => nativeFn(args),
+          { capId: cap.id, source: "native_tool", annotations: null },
+        );
+      } else if (cap.type === "MCP Server") {
+        const mcpConfig = { model: this.model };
+        if (this.logSpreadsheetId) {
+          mcpConfig.log = true;
+          mcpConfig.spreadsheetId = this.logSpreadsheetId;
+        }
+        const mcpApp = new MCPApp(mcpConfig).setServices(this.services);
+        const clientOpts = {
+          apiKey: this.apiKey,
+          prompt,
+          mcpServerUrls: [cap.URL],
+          batchProcess: true,
+          history: [],
+          ...(cap._cachedMcpServerObj
+            ? { cachedMcpServerObj: [cap._cachedMcpServerObj] }
+            : {}),
+        };
+        const tempClient = mcpApp.client(clientOpts);
+        const mcpFuncs = tempClient.functions || { params_: {} };
+        Object.keys(mcpFuncs.params_ || {}).forEach((toolKey) => {
+          if (toolKey === "without_function" || toolKey === "check_process") {
+            return;
+          }
+          if (typeof mcpFuncs[toolKey] !== "function") return;
+          const meta = mcpFuncs.params_[toolKey];
+          registerTool(
+            toolKey,
+            {
+              description: meta.description || "",
+              parameters: meta.parameters,
+            },
+            (args) => mcpFuncs[toolKey](args),
+            {
+              capId: cap.id,
+              source: "mcp_server",
+              annotations: meta.annotations || null,
+            },
+          );
+        });
+      }
+    }
+
+    const directGenConfig = this.generateContentConfig
+      ? { ...this.generateContentConfig }
+      : {};
+    if (
+      /(?:^|\/)gemini-4(?:[-.]|$)/i.test(this.model) &&
+      !directGenConfig.thinkingConfig
+    ) {
+      directGenConfig.thinkingConfig = { thinkingLevel: "LOW" };
+    }
+
+    const directConfig = {
+      apiKey: this.apiKey,
+      model: this.model,
+      functions: boundFunctions,
+      history: [...this.history],
+      systemInstruction: { parts: [{ text: globalInstruction }] },
+      ...(Object.keys(directGenConfig).length > 0
+        ? { generationConfig: directGenConfig }
+        : {}),
+    };
+
+    const answer = this._generateContent(directConfig, prompt);
+    log("[Direct Mode] Execution complete.");
+
+    const afterAgentRes = this.hookManager.execute("AfterAgent", {
+      finalAnswer: answer,
+      prompt_response: answer,
+      prompt,
+      stop_hook_active: false,
+    });
+    const finalAnswer =
+      afterAgentRes.prompt_response || afterAgentRes.finalAnswer || answer;
+
+    if (afterAgentRes.clearContext === true) {
+      this.history = [];
+    }
+    this.history.push({ role: "user", parts: [{ text: prompt }] });
+    this.history.push({
+      role: "model",
+      parts: [
+        {
+          text:
+            typeof finalAnswer === "string"
+              ? finalAnswer
+              : JSON.stringify(finalAnswer),
+        },
+      ],
+    });
+
+    this.hookManager.execute("SessionEnd", {
+      finalAnswer,
+      error: null,
+      prompt,
+      reason: "exit",
+    });
+    return finalAnswer;
+  }
+
+  _getUtf8ByteLength_(str) {
+    if (typeof Utilities !== "undefined" && typeof Utilities.newBlob === "function") {
+      return Utilities.newBlob(str, "application/json").getBytes().length;
+    }
+    if (typeof Buffer !== "undefined") {
+      return Buffer.byteLength(str, "utf8");
+    }
+    return str.length * 3;
+  }
+
+  deleteState(sessionId) {
+    if (!this.services || !this.services.properties) return;
+    const props = this.services.properties;
+    const metaKey = "HITL_STATE_" + sessionId;
+    const existing = props.getProperty(metaKey);
+    if (existing) {
+      try {
+        const parsed = JSON.parse(existing);
+        if (parsed && parsed._chunked && Number(parsed.chunks) > 0) {
+          for (let i = 0; i < parsed.chunks; i++) {
+            props.deleteProperty(`${metaKey}_${i}`);
+          }
+        }
+      } catch (e) {
+        // Ignore parse error on non-meta legacy values
+      }
+      props.deleteProperty(metaKey);
+    }
+  }
+
   saveState() {
     const stateData = {
       sessionId: this.sessionId,
@@ -1495,10 +1866,55 @@ Instructions:
       taskResults: this.taskResults || [],
       highestTaskId: this.highestTaskId || 0,
       replanCount: this.replanCount || 0,
-      suspendedTask: this.suspendedTask || null
+      suspendedTask: this.suspendedTask || null,
     };
     if (this.services && this.services.properties) {
-      this.services.properties.setProperty("HITL_STATE_" + this.sessionId, JSON.stringify(stateData));
+      const props = this.services.properties;
+      const metaKey = "HITL_STATE_" + this.sessionId;
+      const jsonStr = JSON.stringify(stateData);
+      const byteLen = this._getUtf8ByteLength_(jsonStr);
+      const MAX_PROP_BYTES = 8000; // Safe margin under GAS 9KB (9,216 byte) limit
+
+      // Clean any prior chunks before writing
+      this.deleteState(this.sessionId);
+
+      if (byteLen <= MAX_PROP_BYTES) {
+        props.setProperty(metaKey, jsonStr);
+      } else {
+        let encoded = jsonStr;
+        let compressed = false;
+        if (
+          typeof Utilities !== "undefined" &&
+          typeof Utilities.gzip === "function" &&
+          typeof Utilities.base64Encode === "function"
+        ) {
+          const gzBlob = Utilities.gzip(
+            Utilities.newBlob(jsonStr, "application/json", "state.json"),
+          );
+          encoded = Utilities.base64Encode(gzBlob.getBytes());
+          compressed = true;
+        }
+        const chunkSize = 7500;
+        const chunks = [];
+        for (let i = 0; i < encoded.length; i += chunkSize) {
+          chunks.push(encoded.slice(i, i + chunkSize));
+        }
+        const batch = {};
+        chunks.forEach((c, idx) => {
+          batch[`${metaKey}_${idx}`] = c;
+        });
+        batch[metaKey] = JSON.stringify({
+          _chunked: true,
+          compressed,
+          chunks: chunks.length,
+          savedAt: new Date().toISOString(),
+        });
+        if (typeof props.setProperties === "function") {
+          props.setProperties(batch, false);
+        } else {
+          Object.entries(batch).forEach(([k, v]) => props.setProperty(k, v));
+        }
+      }
     }
     return stateData;
   }
@@ -1506,9 +1922,35 @@ Instructions:
   loadState(sessionId) {
     let stateData = null;
     if (this.services && this.services.properties) {
-      const dataStr = this.services.properties.getProperty("HITL_STATE_" + sessionId);
+      const props = this.services.properties;
+      const metaKey = "HITL_STATE_" + sessionId;
+      const dataStr = props.getProperty(metaKey);
       if (dataStr) {
-        stateData = JSON.parse(dataStr);
+        const parsed = JSON.parse(dataStr);
+        if (parsed && parsed._chunked && Number(parsed.chunks) > 0) {
+          let assembled = "";
+          for (let i = 0; i < parsed.chunks; i++) {
+            const part = props.getProperty(`${metaKey}_${i}`);
+            if (part === null || part === undefined) {
+              throw new Error(
+                `Corrupted chunked state for sessionId ${sessionId}: missing chunk ${i}`,
+              );
+            }
+            assembled += part;
+          }
+          if (parsed.compressed) {
+            const rawBlob = Utilities.newBlob(
+              Utilities.base64Decode(assembled),
+              "application/x-gzip",
+            );
+            const unzipped = Utilities.ungzip(rawBlob).getDataAsString("UTF-8");
+            stateData = JSON.parse(unzipped);
+          } else {
+            stateData = JSON.parse(assembled);
+          }
+        } else {
+          stateData = parsed;
+        }
       }
     }
     if (!stateData && this.sessionId === sessionId) {
@@ -1522,7 +1964,7 @@ Instructions:
         taskResults: this.taskResults,
         highestTaskId: this.highestTaskId,
         replanCount: this.replanCount,
-        suspendedTask: this.suspendedTask
+        suspendedTask: this.suspendedTask,
       };
     }
     return stateData;
@@ -1549,11 +1991,7 @@ Instructions:
       this.hookManager.sessionId = this.sessionId;
     }
 
-    const log = (message, data = null) => {
-      const entry = { timestamp: new Date().toISOString(), message, data };
-      this.logs.push(entry);
-      if (typeof logCallback === "function") logCallback(entry);
-    };
+    const log = this._createLogger(logCallback);
 
     log(`Resuming execution for session ${sessionId} with decision: ${approvalDecision}`);
 
@@ -1561,9 +1999,7 @@ Instructions:
       const susp = this.suspendedTask;
       this.suspendedTask = null;
 
-      if (this.services && this.services.properties) {
-        this.services.properties.deleteProperty("HITL_STATE_" + sessionId);
-      }
+      this.deleteState(sessionId);
 
       if (approvalDecision === "allow" || approvalDecision === "approve") {
         log(`Task [${susp.task ? susp.task.task_id : "unknown"}] approved by human. Executing...`);
@@ -1774,23 +2210,10 @@ Instructions:
   }
 
   _runRemainingQueueAndSynthesize(logCallback = null) {
-    const log = (message, data = null) => {
-      const entry = { timestamp: new Date().toISOString(), message, data };
-      this.logs.push(entry);
-      const notifyRes = this.hookManager.execute("Notification", { 
-        message, 
-        data, 
-        toolName: data?.capability_id || "",
-        notification_type: "Log",
-        details: data
-      });
-      if (notifyRes.systemMessage && typeof logCallback === "function") {
-        logCallback({ timestamp: new Date().toISOString(), message: `[Hook Notification Message] ${notifyRes.systemMessage}`, data });
-      }
-      if (typeof logCallback === "function") logCallback(entry);
-    };
+    const log = this._createLogger(logCallback);
 
     const prompt = this.currentPrompt;
+    if (!this.startTime) this.startTime = Date.now();
 
     try {
       while (this.planQueue.length > 0) {
@@ -1809,11 +2232,23 @@ Instructions:
 
         let contextStr = "";
         if (task.depends_on && task.depends_on.length > 0) {
-          const dependentResults = this.taskResults.filter(
-            (tr) => task.depends_on.includes(tr.task_id) && !tr.error,
-          );
-          if (dependentResults.length > 0)
-            contextStr = `\n\n[Context from dependent tasks]:\n${JSON.stringify(dependentResults)}`;
+          const dependentResults = this.taskResults
+            .filter((tr) => task.depends_on.includes(tr.task_id) && !tr.error)
+            .map((tr) => ({
+              task_id: tr.task_id,
+              capability_used: tr.capability_used,
+              result: tr.result,
+            }));
+          if (dependentResults.length > 0) {
+            let serializedDeps = JSON.stringify(dependentResults);
+            const maxDepLen = Math.min(this.maxResultLength, 8000);
+            if (serializedDeps.length > maxDepLen) {
+              serializedDeps =
+                serializedDeps.substring(0, maxDepLen) +
+                "...[TRUNCATED: Dependent context exceeded limit]";
+            }
+            contextStr = `\n\n[Context from dependent tasks]:\n${serializedDeps}`;
+          }
         }
 
         const finalExecutionPrompt = task.execution_prompt + contextStr;
@@ -1850,6 +2285,11 @@ Instructions:
           const activeExecutionPrompt = beforeToolRes.executionPrompt || finalExecutionPrompt;
 
           while (retries >= 0) {
+            const innerElapsed = Date.now() - this.startTime;
+            if (innerElapsed > this.timeoutMs) {
+              taskError = `Execution aborted by timeout safeguard (${innerElapsed}ms > ${this.timeoutMs}ms).`;
+              break;
+            }
             try {
               rawResultData = this._executeTask(cap, activeExecutionPrompt, task);
               if (this.suspendedTask) {
@@ -1861,11 +2301,13 @@ Instructions:
               if (err.message && err.message.startsWith("SUSPENDED")) {
                 throw err;
               }
-              if (retries === 0) {
-                taskError = err.message;
+              const errMsg = err?.message || String(err);
+              if (retries <= 0) {
+                taskError = errMsg;
+                break;
               } else {
-                log(`Task [${task.task_id}] failed, retrying...`, {
-                  error: err.message,
+                log(`Task [${task.task_id}] failed, retrying... Error: ${errMsg}`, {
+                  error: errMsg,
                 });
                 Utilities.sleep(2000);
                 retries--;
@@ -1935,7 +2377,7 @@ Instructions:
             error: taskError,
             duration_ms: durationMs,
           });
-          log(`Task [${task.task_id}] failed definitively in ${durationMs}ms.`, {
+          log(`Task [${task.task_id}] failed definitively in ${durationMs}ms. Error: ${taskError}`, {
             error: taskError,
           });
 
@@ -2181,11 +2623,14 @@ var GeminiWithFiles = class GeminiWithFiles {
       resumableUploadAsNewUpload = false,
       generationConfig = {},
       skillFolderId,
+      useParametersJsonSchema = false,
     } = object;
 
-    // Updated default model to models/gemini-3.1-flash-lite
-    this.model = model || "models/gemini-3.1-flash-lite";
+    // Updated default model to models/gemini-4-hydrogen
+    this.model = model || "models/gemini-4-hydrogen";
     this.version = version || "v1beta";
+    this.useParametersJsonSchema = Boolean(useParametersJsonSchema);
+    this._lastModelParts = [];
 
     const baseUrl = "https://generativelanguage.googleapis.com";
     this.urlGenerateContent = `${baseUrl}/${this.version}/${this.model}:generateContent`;
@@ -2434,24 +2879,36 @@ var GeminiWithFiles = class GeminiWithFiles {
     if (!q && jsonSchema && !parts)
       q = `Follow JSON schema.<JSONSchema>${JSON.stringify(jsonSchema)}</JSONSchema>`;
 
-    // Sanitize parameters to avoid INVALID_ARGUMENT crashes caused by empty required arrays.
+    // Build function_declarations: use parametersJsonSchema when opted in on v1beta,
+    // otherwise recursively sanitize parameters for universal OpenAPI 3.0 Schema compatibility.
     const function_declarations = Object.entries(this.functions).reduce(
       (acc, [k, v]) => {
         if (k !== "params_") {
-          let parameters = this.functions.params_[k]?.parameters;
-          if (
-            parameters &&
-            Array.isArray(parameters.required) &&
-            parameters.required.length === 0
-          ) {
-            parameters = { ...parameters };
-            delete parameters.required;
-          }
-          acc.push({
+          const rawParameters = this.functions.params_[k]?.parameters;
+          const decl = {
             name: k,
             description: this.functions.params_[k]?.description,
-            parameters: parameters,
-          });
+          };
+          if (this.useParametersJsonSchema && this.version === "v1beta") {
+            if (rawParameters && typeof rawParameters === "object") {
+              const isEmptyObj =
+                String(rawParameters.type || "").toLowerCase() === "object" &&
+                (!rawParameters.properties ||
+                  Object.keys(rawParameters.properties).length === 0);
+              if (!isEmptyObj) {
+                decl.parametersJsonSchema = rawParameters;
+              }
+            }
+          } else {
+            const sanitizedParameters = this._sanitizeToolParameters(
+              rawParameters,
+              true,
+            );
+            if (sanitizedParameters !== undefined) {
+              decl.parameters = sanitizedParameters;
+            }
+          }
+          acc.push(decl);
         }
         return acc;
       },
@@ -2485,12 +2942,18 @@ var GeminiWithFiles = class GeminiWithFiles {
 
     let check = [];
     let usageMetadataObj;
+    let cumulativeInputTokens = 0;
+    let cumulativeOutputTokens = 0;
+    let cumulativeTotalTokens = 0;
+    let llmCallCount = 0;
     let results = [];
+    let lastPartsAr = [];
     let rawResult = {};
     let multipleResults = false;
     let continueLoop = false;
     let toolCallHistory = new Set();
     let forceHaltResult = null;
+    const isGemini4 = /(?:^|\/)gemini-4(?:[-.]|$)/i.test(this.model);
 
     const url = this.addQueryParameters_(
       this.urlGenerateContent,
@@ -2505,9 +2968,10 @@ var GeminiWithFiles = class GeminiWithFiles {
       return {
         returnValue: val,
         usageMetadata: usageMetadataObj,
-        inputTokenCount: usageMetadataObj?.promptTokenCount || 0,
-        outputTokenCount: usageMetadataObj?.candidatesTokenCount || 0,
-        totalTokenCount: usageMetadataObj?.totalTokenCount || 0,
+        inputTokenCount: cumulativeInputTokens,
+        outputTokenCount: cumulativeOutputTokens,
+        totalTokenCount: cumulativeTotalTokens,
+        llmCallCount,
       };
     };
 
@@ -2522,14 +2986,59 @@ var GeminiWithFiles = class GeminiWithFiles {
       if (toolsArray.length > 0) payload.tools = toolsArray;
 
       payload.generationConfig = { ...this.generationConfig };
+      if (payload.generationConfig.thinkingConfig) {
+        payload.generationConfig.thinkingConfig = {
+          ...payload.generationConfig.thinkingConfig,
+        };
+      }
       if (this.response_mime_type)
         payload.generationConfig.response_mime_type = this.response_mime_type;
       if (this.response_schema) {
+        delete payload.generationConfig.responseJsonSchema;
+        delete payload.generationConfig.response_json_schema;
         payload.generationConfig.response_schema = this.response_schema;
         payload.generationConfig.response_mime_type = "application/json";
+      } else if (this.response_json_schema) {
+        delete payload.generationConfig.response_schema;
+        delete payload.generationConfig.responseSchema;
+        payload.generationConfig.responseJsonSchema = this.response_json_schema;
+        if (
+          !payload.generationConfig.response_mime_type &&
+          !payload.generationConfig.responseMimeType
+        ) {
+          payload.generationConfig.response_mime_type = "application/json";
+        }
       }
       if (this.temperature !== null)
         payload.generationConfig.temperature = this.temperature;
+
+      // Gemini 4 compatibility guard: enforce thinkingLevel-only & strip HTTP-400-prone params
+      if (isGemini4) {
+        delete payload.generationConfig.frequencyPenalty;
+        delete payload.generationConfig.frequency_penalty;
+        delete payload.generationConfig.presencePenalty;
+        delete payload.generationConfig.presence_penalty;
+        delete payload.generationConfig.candidateCount;
+        delete payload.generationConfig.candidate_count;
+        if (payload.generationConfig.thinkingConfig) {
+          const tc = payload.generationConfig.thinkingConfig;
+          if (tc.thinkingBudget !== undefined) {
+            const oldBudget = tc.thinkingBudget;
+            delete tc.thinkingBudget;
+            if (oldBudget === 0 && !tc.thinkingLevel) {
+              tc.thinkingLevel = "LOW";
+            }
+            console.warn(
+              "[GeminiWithFiles] Stripped unsupported 'thinkingBudget' for Gemini 4 model.",
+            );
+          }
+          if (tc.thinkingLevel) {
+            const normLevel = String(tc.thinkingLevel).toUpperCase();
+            tc.thinkingLevel = normLevel === "MINIMAL" ? "LOW" : normLevel;
+          }
+        }
+      }
+
       if (this.systemInstruction)
         payload.systemInstruction = this.systemInstruction;
 
@@ -2539,14 +3048,20 @@ var GeminiWithFiles = class GeminiWithFiles {
         (this.tools && this.tools.length > 0)
       ) {
         currentToolConfig.functionCallingConfig =
-          currentToolConfig.functionCallingConfig || { mode: "AUTO" };
+          currentToolConfig.functionCallingConfig
+            ? { ...currentToolConfig.functionCallingConfig }
+            : { mode: "AUTO" };
+        if (currentToolConfig.functionCallingConfig.mode) {
+          currentToolConfig.functionCallingConfig.mode = String(
+            currentToolConfig.functionCallingConfig.mode,
+          ).toUpperCase();
+        }
         if (
           function_declarations.length > 0 &&
           this.tools &&
           this.tools.length > 0
         ) {
           currentToolConfig.includeServerSideToolInvocations = true;
-          currentToolConfig.include_server_side_tool_invocations = true;
         }
       }
       if (Object.keys(currentToolConfig).length > 0)
@@ -2579,6 +3094,14 @@ var GeminiWithFiles = class GeminiWithFiles {
       rawResult = raw;
       const { candidates, usageMetadata } = raw;
       usageMetadataObj = usageMetadata;
+      llmCallCount++;
+      if (usageMetadata) {
+        cumulativeInputTokens += usageMetadata.promptTokenCount || 0;
+        cumulativeOutputTokens +=
+          (usageMetadata.candidatesTokenCount || 0) +
+          (usageMetadata.thoughtsTokenCount || 0);
+        cumulativeTotalTokens += usageMetadata.totalTokenCount || 0;
+      }
 
       if (!candidates || candidates.length === 0) break;
       const candidate = candidates[0];
@@ -2634,7 +3157,10 @@ var GeminiWithFiles = class GeminiWithFiles {
             this.history = contents;
             continueLoop = true;
 
-            if (this.toolConfig?.functionCallingConfig?.mode === "any") {
+            if (
+              this.toolConfig?.functionCallingConfig?.mode?.toUpperCase() ===
+              "ANY"
+            ) {
               this.toolConfig.functionCallingConfig.mode = "AUTO";
               delete this.toolConfig.functionCallingConfig.allowedFunctionNames;
             }
@@ -2653,13 +3179,15 @@ var GeminiWithFiles = class GeminiWithFiles {
       }
 
       const partsAr = candidate.content.parts;
+      lastPartsAr = partsAr;
+      this._lastModelParts = partsAr;
       results.push(...partsAr);
       contents.push({ parts: [...partsAr], role: "model" });
 
       check = partsAr.filter((pp) => pp.functionCall?.name);
       continueLoop = false;
       let hasCodeExecutionResult = partsAr.some((pp) => pp.codeExecutionResult);
-      let hasText = partsAr.some((pp) => pp.text);
+      let hasText = partsAr.some((pp) => pp.text && !pp.thought);
 
       if (check.length > 0) {
         if (check.length > 1) multipleResults = true;
@@ -2715,7 +3243,10 @@ var GeminiWithFiles = class GeminiWithFiles {
           this.history = contents;
           continueLoop = true;
 
-          if (this.toolConfig?.functionCallingConfig?.mode === "any") {
+          if (
+            this.toolConfig?.functionCallingConfig?.mode?.toUpperCase() ===
+            "ANY"
+          ) {
             this.toolConfig.functionCallingConfig.mode = "AUTO";
             delete this.toolConfig.functionCallingConfig.allowedFunctionNames;
           }
@@ -2730,7 +3261,7 @@ var GeminiWithFiles = class GeminiWithFiles {
           if (functionName.startsWith("google_interpreter_"))
             functionName = functionName.replace("google_interpreter_", "");
 
-          const argsObj = chk.functionCall.args || null;
+          const argsObj = chk.functionCall.args || {};
           const sig = `${functionName}::${JSON.stringify(argsObj)}`;
           let res2;
 
@@ -2784,14 +3315,17 @@ var GeminiWithFiles = class GeminiWithFiles {
           });
         }
 
-        contents.push({ parts: partss, role: "function" });
+        contents.push({ parts: partss, role: "user" });
         this.history = contents;
 
         if (forceHaltResult) {
           continueLoop = false;
         } else {
           continueLoop = true;
-          if (this.toolConfig?.functionCallingConfig?.mode === "any") {
+          if (
+            this.toolConfig?.functionCallingConfig?.mode?.toUpperCase() ===
+            "ANY"
+          ) {
             this.toolConfig.functionCallingConfig.mode = "AUTO";
             delete this.toolConfig.functionCallingConfig.allowedFunctionNames;
           }
@@ -2823,19 +3357,27 @@ var GeminiWithFiles = class GeminiWithFiles {
       return formatReturnValue(forceHaltResult);
     }
 
-    const output = results[results.length - 1];
+    const nonThoughtTextParts = (lastPartsAr || []).filter(
+      (p) => p && typeof p.text === "string" && !p.thought,
+    );
+    const nonThoughtParts = (lastPartsAr || []).filter((p) => p && !p.thought);
+    const output =
+      nonThoughtParts[nonThoughtParts.length - 1] ||
+      results[results.length - 1];
+
     if (
       !output ||
       (output.finishReason &&
         ["OTHER", "RECITATION"].includes(output.finishReason))
     )
-      return "No values.";
+      return formatReturnValue("No values.");
 
-    let returnValue = multipleResults
-      ? results.filter((pp) => pp.functionResponse)
-      : output.text
-        ? output.text.trim()
-        : output;
+    let returnValue =
+      nonThoughtTextParts.length > 0
+        ? nonThoughtTextParts.map((p) => p.text).join("").trim()
+        : output.text && !output.thought
+          ? output.text.trim()
+          : output;
 
     let parsedReturnValue;
     try {
@@ -2972,6 +3514,97 @@ var GeminiWithFiles = class GeminiWithFiles {
       description: descMatch ? descMatch[1].trim() : "",
       instructions: match[2].trim(),
     };
+  }
+
+  /**
+   * Recursively sanitizes JSON Schema / MCP inputSchema objects for Gemini
+   * FunctionDeclaration.parameters (OpenAPI 3.0 Schema protobuf) using a strict
+   * whitelist so unknown JSON Schema or vendor keywords (e.g., `deprecated`,
+   * `x-google-enum-descriptions`, `$schema`, `additionalProperties`, `default`)
+   * can never trigger HTTP 400 INVALID_ARGUMENT.
+   */
+  _sanitizeToolParameters(schema, isRoot = false) {
+    if (!schema || typeof schema !== "object") return undefined;
+
+    const allowedKeys = new Set([
+      "type",
+      "format",
+      "description",
+      "nullable",
+      "enum",
+      "items",
+      "maxItems",
+      "minItems",
+      "properties",
+      "required",
+      "anyOf",
+      "minimum",
+      "maximum",
+      "pattern",
+    ]);
+
+    const cleaned = {};
+    for (const [k, v] of Object.entries(schema)) {
+      if (!allowedKeys.has(k) || v === undefined) continue;
+
+      if (k === "type") {
+        if (Array.isArray(v)) {
+          const nonNull = v.find((t) => String(t).toLowerCase() !== "null");
+          if (nonNull) cleaned.type = nonNull;
+          if (v.some((t) => String(t).toLowerCase() === "null")) {
+            cleaned.nullable = true;
+          }
+        } else {
+          cleaned.type = v;
+        }
+      } else if (k === "required") {
+        if (Array.isArray(v) && v.length > 0) {
+          cleaned.required = v;
+        }
+      } else if (k === "properties" && v && typeof v === "object") {
+        const cleanedProps = {};
+        for (const [pk, pv] of Object.entries(v)) {
+          const sanitizedProp = this._sanitizeToolParameters(pv, false);
+          if (sanitizedProp !== undefined) {
+            cleanedProps[pk] = sanitizedProp;
+          }
+        }
+        if (Object.keys(cleanedProps).length > 0) {
+          cleaned.properties = cleanedProps;
+        }
+      } else if (k === "items" && v && typeof v === "object") {
+        const itemSchema = Array.isArray(v) ? v[0] : v;
+        const sanitizedItems = this._sanitizeToolParameters(itemSchema, false);
+        if (sanitizedItems !== undefined) {
+          cleaned.items = sanitizedItems;
+        }
+      } else if (k === "anyOf" && Array.isArray(v)) {
+        const sanitizedAnyOf = v
+          .map((item) => this._sanitizeToolParameters(item, false))
+          .filter((item) => item !== undefined);
+        if (sanitizedAnyOf.length > 0) {
+          cleaned.anyOf = sanitizedAnyOf;
+        }
+      } else {
+        cleaned[k] = v;
+      }
+    }
+
+    if (cleaned.required && cleaned.properties) {
+      cleaned.required = cleaned.required.filter(
+        (rk) => Object.prototype.hasOwnProperty.call(cleaned.properties, rk),
+      );
+      if (cleaned.required.length === 0) delete cleaned.required;
+    }
+
+    if (
+      String(cleaned.type || "").toLowerCase() === "object" &&
+      (!cleaned.properties || Object.keys(cleaned.properties).length === 0)
+    ) {
+      return isRoot ? undefined : cleaned;
+    }
+
+    return Object.keys(cleaned).length > 0 ? cleaned : undefined;
   }
 
   addQueryParameters_(url, obj) {
@@ -3115,7 +3748,7 @@ var A2AApp = class A2AApp {
    * @param {String} [object.accessKey] Access key for A2A server (optional).
    * @param {Boolean} [object.log] Enable logging to Google Sheets (default: false).
    * @param {String} [object.spreadsheetId] Spreadsheet ID for logs.
-   * @param {String} [object.model] Model name (default: "models/gemini-3.1-flash-lite").
+   * @param {String} [object.model] Model name (default: "models/gemini-4-hydrogen").
    */
   constructor(object = {}) {
     const { accessKey = null, log = false, spreadsheetId, model } = object;
@@ -3124,7 +3757,7 @@ var A2AApp = class A2AApp {
     this.accessKey = accessKey;
 
     /** @private */
-    this.model = model || "models/gemini-3.1-flash-lite";
+    this.model = model || "models/gemini-4-hydrogen";
 
     /** @private */
     this.jsonrpc = "2.0";
@@ -3300,26 +3933,6 @@ var A2AApp = class A2AApp {
     console.log("--- Server side initialized");
     this.errorProcess_(object);
     let id = "No ID";
-    const lock = this.lock;
-
-    // [Phase 1: Concurrency Control] Server-side locking to prevent race conditions
-    if (!lock.tryLock(350000)) {
-      const msg =
-        "[Phase 1: Concurrency Control] Timeout. Lock could not be acquired.";
-      console.error(msg);
-      return this.createErrorResponse_(
-        `Internal server error. Error message: ${msg}`,
-        id,
-        "[Phase 1: Concurrency Control]",
-      );
-    }
-    this.addLog_(
-      new Date(),
-      "[Phase 1: Concurrency Control]",
-      id,
-      "server internal",
-      "Lock acquired successfully.",
-    );
 
     try {
       const { eventObject, agentCardUrls = [], agentCards = [] } = object;
@@ -3341,8 +3954,6 @@ var A2AApp = class A2AApp {
         id,
         "Server Main Process",
       );
-    } finally {
-      lock.releaseLock();
     }
   }
 
@@ -3355,35 +3966,6 @@ var A2AApp = class A2AApp {
   client(object = {}) {
     this.contextType = "client";
     console.log("--- Client side initialized");
-    const lock = this.lock;
-
-    // [Phase 1: Concurrency Control] Client-side locking
-    if (!lock.tryLock(350000)) {
-      const msg =
-        "[Phase 1: Concurrency Control] Timeout. Lock could not be acquired.";
-      console.error(msg);
-      const errObj = {
-        error: {
-          message: `[A2A Client Error] Internal server error. Error message: ${msg}`,
-        },
-      };
-      this.addLog_(
-        new Date(),
-        "[Phase 1: Concurrency Control]",
-        null,
-        "client internal",
-        JSON.stringify(errObj),
-      );
-      this.log_();
-      return errObj;
-    }
-    this.addLog_(
-      new Date(),
-      "[Phase 1: Concurrency Control]",
-      null,
-      "client internal",
-      "Lock acquired successfully.",
-    );
 
     try {
       // [Phase 2: Agent Discovery] Fetch Agent Cards
@@ -3433,8 +4015,6 @@ var A2AApp = class A2AApp {
       );
       this.log_();
       return errObj;
-    } finally {
-      lock.releaseLock();
     }
   }
 
@@ -3749,7 +4329,12 @@ var A2AApp = class A2AApp {
    */
   log_() {
     if (!this.log || !this.sheet || this.values.length === 0) return;
+    const lock = this.lock;
+    let locked = false;
     try {
+      if (lock && typeof lock.tryLock === "function") {
+        locked = lock.tryLock(15000);
+      }
       const rows = this.values.map((r) =>
         r.map((c) => (typeof c === "string" ? c.substring(0, 40000) : c)),
       );
@@ -3759,6 +4344,10 @@ var A2AApp = class A2AApp {
       this.values = [];
     } catch (err) {
       console.error("--- Failed to write to log sheet.", err);
+    } finally {
+      if (locked && lock && typeof lock.releaseLock === "function") {
+        lock.releaseLock();
+      }
     }
   }
 
@@ -4526,21 +5115,28 @@ var A2AApp = class A2AApp {
                 ];
               }
 
-              // Manually patch the history array as the loop bypass prevents GeminiWithFiles from appending the call details automatically.
+              // Manually patch the history array while preserving Gemini 3/4 thoughtSignature.
               if (funcRes.name && funcRes.argsObj) {
-                gg.history.push({
-                  role: "model",
-                  parts: [
-                    {
+                const matchedPart = Array.isArray(gg._lastModelParts)
+                  ? gg._lastModelParts.find(
+                      (p) => p?.functionCall?.name === funcRes.name,
+                    )
+                  : null;
+                const modelFcPart = matchedPart
+                  ? { ...matchedPart }
+                  : {
                       functionCall: {
                         name: funcRes.name,
                         args: funcRes.argsObj,
                       },
-                    },
-                  ],
+                      thoughtSignature: "skip_thought_signature_validator",
+                    };
+                gg.history.push({
+                  role: "model",
+                  parts: [modelFcPart],
                 });
                 gg.history.push({
-                  role: "function",
+                  role: "user",
                   parts: [
                     {
                       functionResponse: {
@@ -4743,16 +5339,30 @@ var A2AApp = class A2AApp {
         "Please provide a valid URL (String) including query parameters.",
       );
     }
-    const [baseUrl, query] = url.split("?");
+    const qIdx = url.indexOf("?");
+    if (qIdx === -1) {
+      return { url, queryParameters: null };
+    }
+    const baseUrl = url.slice(0, qIdx);
+    const query = url.slice(qIdx + 1);
     if (!query) {
       return { url: baseUrl, queryParameters: null };
     }
+    const safeDecode = (s) => {
+      try {
+        return decodeURIComponent(s);
+      } catch (e) {
+        return s;
+      }
+    };
     const queryParameters = query.split("&").reduce((acc, param) => {
-      const [key, rawValue] = param.split("=");
-      if (!key) return acc;
-      const k = key.trim();
-      let v = rawValue ? rawValue.trim() : "";
-      v = isNaN(Number(v)) || v === "" ? v : Number(v);
+      if (!param) return acc;
+      const eqIdx = param.indexOf("=");
+      const keyRaw = eqIdx === -1 ? param : param.slice(0, eqIdx);
+      const valRaw = eqIdx === -1 ? "" : param.slice(eqIdx + 1);
+      const k = safeDecode(keyRaw.trim());
+      if (!k) return acc;
+      const v = safeDecode(valRaw.trim());
       if (acc[k]) {
         acc[k].push(v);
       } else {
@@ -4760,7 +5370,11 @@ var A2AApp = class A2AApp {
       }
       return acc;
     }, {});
-    return { url: baseUrl, queryParameters };
+    return {
+      url: baseUrl,
+      queryParameters:
+        Object.keys(queryParameters).length > 0 ? queryParameters : null,
+    };
   }
 
   /**
@@ -4855,7 +5469,7 @@ var MCPApp = class MCPApp {
     } = object;
 
     /** @private */
-    this.model = model || "models/gemini-3.1-flash-lite";
+    this.model = model || "models/gemini-4-hydrogen";
 
     /** @private */
     this.accessKey = accessKey;
@@ -5478,7 +6092,7 @@ var MCPApp = class MCPApp {
     this.clientInfo = { name: "MCPApp_client", version: "1.0.0" };
  
     /** @private */
-    this.model = object.model || this.model || "models/gemini-3.1-flash-lite";
+    this.model = object.model || this.model || "models/gemini-4-hydrogen";
 
     /** @private */
     this.id = 0;
@@ -5550,6 +6164,7 @@ var MCPApp = class MCPApp {
       "- DO NOT invent or hallucinate function names. Use EXACTLY the names provided in the <Functions> list.",
       "- Ask the user for clarification if the request is irreconcilably vague.",
       "- Do NOT output or suggest executable code (e.g., 'tool_code' blocks). Only provide the requested format.",
+      `- Keep each allocated "task" description concise (1-2 sentences). NEVER copy large raw data payloads or file lists from <UserPrompt> into the "task" string.`,
       `- Ensure all allocated tasks are terminal. Do not instruct the model to verify task completion or delivery status.`,
       `- If you require the current datetime context, use: "${currentTimestamp}" operating within timezone ${this.timezone}.`,
       "</Important>",
@@ -5576,22 +6191,44 @@ var MCPApp = class MCPApp {
       },
     };
 
+    let totalTokenCount = 0;
+    let llmCallCount = 0;
+    const unwrapTelemetry = (raw) => {
+      if (raw && typeof raw === "object" && raw.returnValue !== undefined) {
+        totalTokenCount += raw.totalTokenCount || 0;
+        llmCallCount += raw.llmCallCount || 1;
+        return raw.returnValue;
+      }
+      llmCallCount += 1;
+      return raw;
+    };
+
+    const isThinkingLevelModel = /(?:^|\/)gemini-[34](?:[-.]|$)/i.test(
+      this.model,
+    );
+    const lowThinkingGenConfig = isThinkingLevelModel
+      ? { generationConfig: { thinkingConfig: { thinkingLevel: "LOW" } } }
+      : {};
+
     const setupObj = {
       apiKey: this.clientObject.apiKey,
       systemInstruction: {
         parts: [{ text: systemInstructionText }],
-        role: "model",
       },
       model: this.model,
       responseMimeType: "application/json",
       responseSchema,
+      exportTotalTokens: true,
+      ...lowThinkingGenConfig,
     };
 
     const geminiOrchestrator = new GeminiWithFiles(setupObj);
     const orchestratorPrompt = `User's input prompt:\n<UserPrompt>${this.clientObject.prompt}</UserPrompt>`;
-    const executedOrders = geminiOrchestrator.generateContent({
-      q: orchestratorPrompt,
-    });
+    const executedOrders = unwrapTelemetry(
+      geminiOrchestrator.generateContent({
+        q: orchestratorPrompt,
+      }),
+    );
 
     if (!Array.isArray(executedOrders) || executedOrders.length === 0) {
       const errObj = {
@@ -5648,11 +6285,13 @@ var MCPApp = class MCPApp {
       console.log(`--- Executing function: "${name}" | Objective: "${task}"`);
 
       const funcCallWrapper = {
-        params_: {
-          [name]: this.functions.params_[name],
-        },
-        [name]: this.functions[name],
+        params_: {},
       };
+
+      if (this.functions.params_[name] && typeof this.functions[name] === "function") {
+        funcCallWrapper.params_[name] = this.functions.params_[name];
+        funcCallWrapper[name] = this.functions[name];
+      }
 
       if (
         name !== "without_function" &&
@@ -5664,15 +6303,9 @@ var MCPApp = class MCPApp {
           this.functions["without_function"];
       }
 
-      if (name !== "check_process" && this.functions.params_["check_process"]) {
-        funcCallWrapper.params_["check_process"] =
-          this.functions.params_["check_process"];
-        funcCallWrapper["check_process"] = this.functions["check_process"];
-      }
-
-      const allowedTools = Array.from(
-        new Set([name, "without_function", "check_process"]),
-      );
+      // Only expose check_process when the planned step is explicitly "check_process",
+      // preventing models from prematurely halting the pipeline on normal tool steps.
+      const allowedTools = Object.keys(funcCallWrapper.params_);
 
       const executeObj = {
         apiKey: this.clientObject.apiKey,
@@ -5680,12 +6313,13 @@ var MCPApp = class MCPApp {
         functions: funcCallWrapper,
         systemInstruction: {
           parts: [{ text: executionSystemInstruction }],
-          role: "model",
         },
         history: conversationHistory,
+        exportTotalTokens: true,
+        ...lowThinkingGenConfig,
         toolConfig: {
           functionCallingConfig: {
-            mode: "any",
+            mode: "ANY",
             allowedFunctionNames: allowedTools,
           },
         },
@@ -5695,7 +6329,9 @@ var MCPApp = class MCPApp {
       const executionPrompt = `Current execution objective:\n<Task>${task}</Task>`;
 
       // Execute inner sequence. Returns standard text OR intercepts _gemini_halt signals safely.
-      const res = geminiExecutor.generateContent({ q: executionPrompt });
+      const res = unwrapTelemetry(
+        geminiExecutor.generateContent({ q: executionPrompt }),
+      );
 
       // Cleaned up, robust Halt Signal evaluation
       if (res && typeof res === "object" && res._gemini_halt) {
@@ -5720,10 +6356,13 @@ var MCPApp = class MCPApp {
           typeof res === "string" ? res : res.text || JSON.stringify(res);
         generationResults.push(fallbackText);
 
-        const lastHistoryPart =
-          geminiExecutor.history[geminiExecutor.history.length - 1]?.parts?.[0];
-        if (lastHistoryPart && !lastHistoryPart.functionResponse) {
-          lastHistoryPart.text = fallbackText;
+        const lastHistoryParts =
+          geminiExecutor.history[geminiExecutor.history.length - 1]?.parts || [];
+        const targetTextPart = lastHistoryParts.find(
+          (p) => p && !p.thought && !p.functionResponse && p.text !== undefined,
+        );
+        if (targetTextPart) {
+          targetTextPart.text = fallbackText;
         }
       } else {
         generationResults.push(
@@ -5757,22 +6396,28 @@ var MCPApp = class MCPApp {
       (e) => typeof e === "string",
     );
 
-    // Final summarization phase if text results exist
-    if (standardTextResults.length > 0) {
+    // Final summarization phase if text results exist (skip if caller opted out on single result)
+    if (
+      standardTextResults.length > 0 &&
+      !(this.clientObject.skipFinalSummary && standardTextResults.length === 1)
+    ) {
       const geminiSummarizer = new GeminiWithFiles({
         apiKey: this.clientObject.apiKey,
         model: this.model,
         history: conversationHistory,
+        exportTotalTokens: true,
       });
-      const finalSummary = geminiSummarizer.generateContent({
-        parts: [
-          {
-            text: "Synthesize the results strictly answering the user's initial prompt.",
-          },
-          { text: `<Question>${this.clientObject.prompt}</Question>` },
-          { text: `<Answers>\n${standardTextResults.join("\n")}\n</Answers>` },
-        ],
-      });
+      const finalSummary = unwrapTelemetry(
+        geminiSummarizer.generateContent({
+          parts: [
+            {
+              text: "Synthesize the results strictly answering the user's initial prompt.",
+            },
+            { text: `<Question>${this.clientObject.prompt}</Question>` },
+            { text: `<Answers>\n${standardTextResults.join("\n")}\n</Answers>` },
+          ],
+        }),
+      );
       geminiOrchestrator.history = geminiSummarizer.history;
       finalOutputs = [
         finalSummary,
@@ -5789,7 +6434,12 @@ var MCPApp = class MCPApp {
     ]);
     console.log("--- end: Sequence Execution completed.");
 
-    return { result: finalOutputs, history: geminiOrchestrator.history };
+    return {
+      result: finalOutputs,
+      history: geminiOrchestrator.history,
+      totalTokenCount,
+      llmCallCount,
+    };
   }
 
   /**
@@ -5962,11 +6612,53 @@ var MCPApp = class MCPApp {
       activeHeaders = { ...activeHeaders, ...customHeaders };
     }
 
+    // Streamable HTTP MCP compatibility: add default Accept header if not explicitly provided
+    const hasAcceptHeader = Object.keys(activeHeaders).some(
+      (k) => k.toLowerCase() === "accept",
+    );
+    if (!hasAcceptHeader) {
+      activeHeaders["Accept"] = "application/json, text/event-stream";
+    }
+
     if (Object.keys(activeHeaders).length > 0) {
       requestConfig.headers = activeHeaders;
     }
 
     return requestConfig;
+  }
+
+  /**
+   * ### Description
+   * Parses a JSON-RPC 2.0 response from either standard `application/json` or
+   * Streamable HTTP SSE (`text/event-stream`) payloads.
+   *
+   * @param {GoogleAppsScript.URL_Fetch.HTTPResponse} response
+   * @return {Object|null}
+   * @private
+   */
+  parseJsonRpcResponse_(response) {
+    const bodyText = (response.getContentText() || "").trim();
+    if (!bodyText) return null;
+
+    try {
+      return JSON.parse(bodyText);
+    } catch (jsonErr) {
+      // Fallback for Streamable HTTP SSE (text/event-stream): extract last valid JSON data frame
+      const dataLines = bodyText
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .filter((line) => line && line !== "[DONE]");
+
+      for (let i = dataLines.length - 1; i >= 0; i--) {
+        try {
+          return JSON.parse(dataLines[i]);
+        } catch (e) {
+          // Continue scanning prior SSE frames
+        }
+      }
+      return null;
+    }
   }
 
   /**
@@ -6003,17 +6695,66 @@ var MCPApp = class MCPApp {
    */
   getLists_({ method, requests }) {
     this.fetch_(requests).forEach((response, index) => {
-      if (response.getResponseCode() === 200) {
-        try {
-          const parsedRes = JSON.parse(response.getContentText());
-          if (parsedRes?.result) {
-            this.mcpServerObj[index][method] = parsedRes;
-          }
-        } catch (error) {
-          // Silent catch to continue loop resilience
+      const code = response.getResponseCode();
+      const parsedRes = this.parseJsonRpcResponse_(response);
+      if (parsedRes?.result && !parsedRes?.error) {
+        if (code !== 200) {
+          console.warn(
+            `[MCPApp] ${method} returned HTTP ${code} with valid JSON-RPC result; accepting payload.`,
+          );
         }
+        this.mcpServerObj[index][method] = parsedRes;
+        this.fetchRemainingPages_(index, method, parsedRes);
+      } else if (code !== 200 && method === "tools/list") {
+        console.warn(
+          `[MCPApp] ${method} returned HTTP ${code}: ${(response.getContentText() || "").slice(0, 200)}`,
+        );
       }
     });
+  }
+
+  /**
+   * ### Description
+   * Follows MCP `nextCursor` pagination for `tools/list`, `resources/list`, and `prompts/list`.
+   *
+   * @param {number} serverIndex
+   * @param {string} method
+   * @param {Object} initialParsed
+   * @private
+   */
+  fetchRemainingPages_(serverIndex, method, initialParsed) {
+    const subKey = method.split("/")[0];
+    let cursor = initialParsed?.result?.nextCursor;
+    let pages = 0;
+    const maxPages = 10;
+    const serverEntry = this.mcpServerObj[serverIndex];
+    if (!serverEntry) return;
+
+    while (cursor && pages < maxPages) {
+      pages++;
+      const payloadStr = JSON.stringify({
+        method,
+        params: { cursor },
+        jsonrpc: this.jsonrpc,
+        id: ++this.id,
+      });
+      const req = this.createRequest_({
+        u: serverEntry.serverUrl,
+        obj: payloadStr,
+        customHeaders: serverEntry.headers,
+      });
+      const resp = this.fetch_([req])[0];
+      if (!resp || resp.getResponseCode() !== 200) break;
+      const nextParsed = this.parseJsonRpcResponse_(resp);
+      const nextItems = nextParsed?.result?.[subKey];
+      if (Array.isArray(nextItems) && nextItems.length > 0) {
+        if (!Array.isArray(initialParsed.result[subKey])) {
+          initialParsed.result[subKey] = [];
+        }
+        initialParsed.result[subKey].push(...nextItems);
+      }
+      cursor = nextParsed?.result?.nextCursor;
+    }
   }
 
   /**
@@ -6037,16 +6778,21 @@ var MCPApp = class MCPApp {
 
     if (requestPool.length > 0) {
       this.fetch_(requestPool).forEach((response, i) => {
-        if (response.getResponseCode() === 200) {
-          try {
-            const { method, serverIndex } = metadata[i];
-            const parsedObj = JSON.parse(response.getContentText());
-            if (parsedObj?.result) {
-              this.mcpServerObj[serverIndex][method] = parsedObj;
-            }
-          } catch (error) {
-            // Processing failure intentionally omitted for stability.
+        const { method, serverIndex } = metadata[i];
+        const code = response.getResponseCode();
+        const parsedObj = this.parseJsonRpcResponse_(response);
+        if (parsedObj?.result && !parsedObj?.error) {
+          if (code !== 200) {
+            console.warn(
+              `[MCPApp] ${method} returned HTTP ${code} with valid JSON-RPC result; accepting payload.`,
+            );
           }
+          this.mcpServerObj[serverIndex][method] = parsedObj;
+          this.fetchRemainingPages_(serverIndex, method, parsedObj);
+        } else if (code !== 200 && method === "tools/list") {
+          console.warn(
+            `[MCPApp] ${method} returned HTTP ${code}: ${(response.getContentText() || "").slice(0, 200)}`,
+          );
         }
       });
     }
@@ -6075,7 +6821,20 @@ var MCPApp = class MCPApp {
           customHeaders,
         }),
       ]);
-      return responseArray[0].getContentText();
+      const resp = responseArray[0];
+      const statusCode = resp.getResponseCode();
+      const rawText = resp.getContentText();
+      const parsed = this.parseJsonRpcResponse_(resp);
+      if (statusCode < 200 || statusCode >= 300) {
+        if (parsed && parsed.result && !parsed.error) {
+          console.warn(
+            `[MCPApp] Tool call returned HTTP ${statusCode} with valid JSON-RPC result; accepting payload.`,
+          );
+          return JSON.stringify(parsed);
+        }
+        throw new Error(`[MCP HTTP ${statusCode}] ${rawText}`);
+      }
+      return parsed ? JSON.stringify(parsed) : rawText;
     };
 
     const aggregatedServerTools = this.mcpServerObj.reduce(
@@ -6102,7 +6861,7 @@ var MCPApp = class MCPApp {
                   method: routingMap[endpointKey],
                   params: { uri },
                   jsonrpc: this.jsonrpc,
-                  id: this.id++,
+                  id: ++this.id,
                 };
                 return fetchWrapper({
                   payload: dispatchPayload,
@@ -6135,9 +6894,13 @@ var MCPApp = class MCPApp {
                 console.log(`--- Generating Prompt Logic: ${cleanName}`);
                 const dispatchPayload = {
                   method: routingMap[endpointKey],
-                  params: { name: cleanName, arguments: params },
+                  params: {
+                    name: name,
+                    arguments:
+                      params && typeof params === "object" ? params : {},
+                  },
                   jsonrpc: this.jsonrpc,
-                  id: this.id++,
+                  id: ++this.id,
                 };
                 return fetchWrapper({
                   payload: dispatchPayload,
@@ -6150,6 +6913,9 @@ var MCPApp = class MCPApp {
                 title: name,
                 description,
                 parameters: inputSchema,
+                ...(definition.annotations
+                  ? { annotations: definition.annotations }
+                  : {}),
               };
               executionCallback = (params) => {
                 if (this.hookManager) {
@@ -6171,9 +6937,13 @@ var MCPApp = class MCPApp {
                 console.log(`--- Activating Tool Service: ${cleanName}`);
                 const dispatchPayload = {
                   method: routingMap[endpointKey],
-                  params: { name: cleanName, arguments: params },
+                  params: {
+                    name: name,
+                    arguments:
+                      params && typeof params === "object" ? params : {},
+                  },
                   jsonrpc: this.jsonrpc,
-                  id: this.id++,
+                  id: ++this.id,
                 };
                 let result = fetchWrapper({
                   payload: dispatchPayload,
@@ -6248,7 +7018,15 @@ var MCPApp = class MCPApp {
       mcpServerUrls,
       batchProcess = false,
       mcpServerObj,
+      cachedMcpServerObj,
     } = this.clientObject;
+
+    // Fast-path: Reuse already-discovered MCP server metadata (from LlmAgent cache)
+    if (Array.isArray(cachedMcpServerObj) && cachedMcpServerObj.length > 0) {
+      this.mcpServerObj = cachedMcpServerObj;
+      this.createFunctions_();
+      return this;
+    }
 
     // Load pre-installed Server Object library boundaries
     if (Array.isArray(mcpServerObj) && mcpServerObj.length > 0) {
@@ -6334,20 +7112,39 @@ var MCPApp = class MCPApp {
               "server --> client",
               bodyText,
             ]);
-            try {
+            const parsedInit = this.parseJsonRpcResponse_(response);
+            const serverHeaders = { ...validServers[idx].headers };
+            const respHeaders =
+              typeof response.getAllHeaders === "function"
+                ? response.getAllHeaders() || {}
+                : {};
+            const sessionKey = Object.keys(respHeaders).find(
+              (k) => k.toLowerCase() === "mcp-session-id",
+            );
+            if (sessionKey && respHeaders[sessionKey]) {
+              const rawSess = respHeaders[sessionKey];
+              serverHeaders["Mcp-Session-Id"] = Array.isArray(rawSess)
+                ? rawSess[0]
+                : rawSess;
+            }
+            const negotiatedVersion = parsedInit?.result?.protocolVersion;
+            if (negotiatedVersion && String(negotiatedVersion) >= "2025-06-18") {
+              serverHeaders["MCP-Protocol-Version"] = negotiatedVersion;
+            }
+            if (parsedInit) {
               acc.push({
                 serverUrl: validServers[idx].serverUrl,
-                headers: validServers[idx].headers,
+                headers: serverHeaders,
                 original: validServers[idx].original,
-                [methodInit]: JSON.parse(bodyText),
+                [methodInit]: parsedInit,
               });
-            } catch (e) {
+            } else {
               console.warn(
                 `Critical Format Error. Payload from "${validServers[idx].serverUrl}" is not standard MCP JSON. Snippet: ${bodyText.substring(0, 50)}...`,
               );
               acc.push({
                 serverUrl: validServers[idx].serverUrl,
-                headers: validServers[idx].headers,
+                headers: serverHeaders,
                 original: validServers[idx].original,
                 [methodInit]: null,
               });
@@ -6374,8 +7171,8 @@ var MCPApp = class MCPApp {
         params: {
           requestId: this.id,
           reason: `Halted: Integration failure. InternalError code ${this.ErrorCode.InternalError}`,
-          jsonrpc: this.jsonrpc,
         },
+        jsonrpc: this.jsonrpc,
       };
 
       const categorizedReqs = this.mcpServerObj.reduce(
@@ -6524,25 +7321,41 @@ var MCPApp = class MCPApp {
       );
     }
 
-    const parts = url.split("?");
-    if (parts.length === 1) return { url: parts[0], queryParameters: null };
+    const qIdx = url.indexOf("?");
+    if (qIdx === -1) return { url, queryParameters: null };
 
-    const [baseUrl, query] = parts;
-    if (query) {
-      const queryParameters = query.split("&").reduce((acc, paramBlock) => {
-        const [keyRaw, valRaw] = paramBlock.split("=");
-        const key = keyRaw.trim();
-        const valueStr = valRaw.trim();
-        const valueDecoded = isNaN(valueStr) ? valueStr : Number(valueStr);
+    const baseUrl = url.slice(0, qIdx);
+    const query = url.slice(qIdx + 1);
+    if (!query) return { url: baseUrl, queryParameters: null };
 
-        if (acc[key]) acc[key].push(valueDecoded);
-        else acc[key] = [valueDecoded];
+    const safeDecode = (s) => {
+      try {
+        return decodeURIComponent(s);
+      } catch (e) {
+        return s;
+      }
+    };
 
-        return acc;
-      }, {});
-      return { url: baseUrl, queryParameters };
-    }
-    return null;
+    const queryParameters = query.split("&").reduce((acc, paramBlock) => {
+      if (!paramBlock) return acc;
+      const eqIdx = paramBlock.indexOf("=");
+      const keyRaw = eqIdx === -1 ? paramBlock : paramBlock.slice(0, eqIdx);
+      const valRaw = eqIdx === -1 ? "" : paramBlock.slice(eqIdx + 1);
+      const key = safeDecode(keyRaw.trim());
+      if (!key) return acc;
+      const valueStr = safeDecode(valRaw.trim());
+
+      if (acc[key]) acc[key].push(valueStr);
+      else acc[key] = [valueStr];
+
+      return acc;
+    }, {});
+
+    return {
+      url: baseUrl,
+      queryParameters:
+        Object.keys(queryParameters).length > 0 ? queryParameters : null,
+    };
   }
 
   /**
@@ -6672,7 +7485,7 @@ var MCPA2Aserver = class MCPA2Aserver {
     this.apiKey = "";
 
     /** @type {String} Model version to be used for generative AI. */
-    this.model = "models/gemini-3.1-flash-lite";
+    this.model = "models/gemini-4-hydrogen";
 
     /** @type {String} Access key to restrict access to the Web Apps. */
     this.accessKey = "";
@@ -6716,13 +7529,16 @@ var MCPA2Aserver = class MCPA2Aserver {
         ".well-known/agent.json",
       ],
       METHODS: {
-        A2A: ["tasks/send", "message/send"],
+        A2A: ["tasks/send", "message/send", "SendMessage", "GetTask"],
         MCP: [
           "initialize",
           "notifications/initialized",
           "notifications/cancelled",
+          "ping",
           "resources/list",
+          "resources/read",
           "prompts/list",
+          "prompts/get",
           "tools/list",
           "tools/call",
         ],
@@ -7457,8 +8273,8 @@ var MCPA2Aserver = class MCPA2Aserver {
  * Author: Kanshi Tanaike
  * https://github.com/tanaikech/FileSearchApp
  *
- * Updated on 20260624
- * version 1.0.1
+ * Updated on 20251113 1048
+ * version 1.0.0
  */
 
 /**
@@ -7495,11 +8311,11 @@ var FileSearch = class FileSearch {
   /**
    * @param {object} params - The parameters.
    * @param {string} params.apiKey - The Gemini API key.
-   * @param {string} [params.model="models/gemini-3.1-flash-lite"] - The Gemini model name.
+   * @param {string} [params.model="models/gemini-4-hydrogen"] - The Gemini model name.
    */
   constructor({
     apiKey,
-    model = "models/gemini-3.1-flash-lite" /** or models/gemini-2.5-pro */,
+    model = "models/gemini-4-hydrogen" /** or models/gemini-2.5-pro */,
   }) {
     if (!apiKey) {
       throw new Error("API key is required.");
@@ -7785,10 +8601,10 @@ var FileSearch = class FileSearch {
       "text/yaml",
     ];
 
-    const convMimeType_ = (fileBlob) => {
-      if (!supportedMimeTypes.includes(fileBlob.getContentType())) {
+    const convMimeType_ = (fileBlob, targetFileId = null) => {
+      if (!supportedMimeTypes.includes(fileBlob.getContentType()) && targetFileId) {
         return UrlFetchApp.fetch(
-          `https://drive.google.com/thumbnail?sz=w1000&id=${fileId}`,
+          `https://drive.google.com/thumbnail?sz=w1000&id=${targetFileId}`,
           { headers: { authorization: "Bearer " + ScriptApp.getOAuthToken() } },
         ).getBlob();
       }
@@ -7824,7 +8640,7 @@ var FileSearch = class FileSearch {
           JSON.stringify(metadata),
           "application/json",
         ),
-        file: convMimeType_(fileBlob),
+        file: convMimeType_(fileBlob, fileId),
       };
       const endpoint = `/${fileSearchStoreName}:uploadToFileSearchStore`;
       const operation = this._request(
@@ -7993,7 +8809,11 @@ var FileSearch = class FileSearch {
       method: "post",
       payload: JSON.stringify(payload),
     });
-    return response.candidates[0].content.parts.find((p) => p.text).text;
+    const parts = response?.candidates?.[0]?.content?.parts || [];
+    return parts
+      .filter((p) => p && typeof p.text === "string" && !p.thought)
+      .map((p) => p.text)
+      .join("");
   }
 
   // --- Private Helper Methods ---
@@ -8001,11 +8821,18 @@ var FileSearch = class FileSearch {
   /**
    * Polls a long-running operation until it's complete.
    * @param {object} operation - The initial operation object.
+   * @param {number} [maxAttempts=30] - Maximum poll attempts to prevent infinite loops.
    * @returns {object} The completed operation object.
    */
-  _pollOperation(operation) {
+  _pollOperation(operation, maxAttempts = 30) {
     let currentOperation = operation;
-    while (!currentOperation.done) {
+    let attempts = 0;
+    while (currentOperation && !currentOperation.done) {
+      if (++attempts > maxAttempts) {
+        throw new Error(
+          `[FileSearch Error] Operation polling timed out after ${maxAttempts} attempts: ${currentOperation.name}`,
+        );
+      }
       Utilities.sleep(1500); // Wait before polling again
       const endpoint = `/${currentOperation.name}`;
       currentOperation = this._request(endpoint);
