@@ -693,6 +693,132 @@ By combining **GASADK** with the **GoogleApiApp** library, you can build a state
 For the full implementation script and a beginner-friendly setup guide, see:
 👉 **[Google API MCP Server Sample & Setup Guide](https://github.com/tanaikech/adk-gas/tree/master/samples/googleapiapp-mcp-server)**
 
+### 8. Using Official Google Workspace MCP Servers (GA — November 2026)
+
+Google's official hosted **Google Workspace MCP servers** are now **Generally Available (GA)** ([Official Google Workspace Updates Announcement](https://workspaceupdates.googleblog.com/2026/11/mcp-servers-cli-standardized-usage-tiers-now-available.html)). With **GASADK v2.1.0+**, you can connect Google Apps Script directly to Google's remote Workspace MCP servers using `ScriptApp.getOAuthToken()` without deploying any proxy server.
+
+#### Available Official Google Workspace MCP Endpoints
+
+| Workspace Product | Primary Endpoint (`/mcp/v1`) | Self-Mode Fallback (`/mcp/v1self`) | Required GCP Services |
+| :--- | :--- | :--- | :--- |
+| **Google Drive** | `https://drivemcp.googleapis.com/mcp/v1` | `https://drivemcp.googleapis.com/mcp/v1self` | `drive.googleapis.com`, `drivemcp.googleapis.com` |
+| **Gmail** | `https://gmailmcp.googleapis.com/mcp/v1` | `https://gmailmcp.googleapis.com/mcp/v1self` | `gmail.googleapis.com`, `gmailmcp.googleapis.com` |
+| **Google Calendar** | `https://calendarmcp.googleapis.com/mcp/v1` | `https://calendarmcp.googleapis.com/mcp/v1self` | `calendar-json.googleapis.com`, `calendarmcp.googleapis.com` |
+| **Google Docs** | `https://docsmcp.googleapis.com/mcp/v1` | `https://docsmcp.googleapis.com/mcp/v1self` | `docs.googleapis.com`, `docsmcp.googleapis.com` |
+| **Google Sheets** | `https://sheetsmcp.googleapis.com/mcp/v1` | `https://sheetsmcp.googleapis.com/mcp/v1self` | `sheets.googleapis.com`, `sheetsmcp.googleapis.com` |
+| **Google Slides** | `https://slidesmcp.googleapis.com/mcp/v1` | `https://slidesmcp.googleapis.com/mcp/v1self` | `slides.googleapis.com`, `slidesmcp.googleapis.com` |
+| **Google Chat** | `https://chatmcp.googleapis.com/mcp/v1` | `https://chatmcp.googleapis.com/mcp/v1self` | `chat.googleapis.com`, `chatmcp.googleapis.com` |
+| **Google Tasks** | `https://tasksmcp.googleapis.com/mcp/v1` | `https://tasksmcp.googleapis.com/mcp/v1self` | `tasks.googleapis.com`, `tasksmcp.googleapis.com` |
+| **Universal Search** | `https://workspacemcp.googleapis.com/mcp/v1` | — | `workspacemcp.googleapis.com` |
+
+> [!NOTE]
+> - **Usage Tiers**: Google Cloud projects receive the **Standard Tier** automatically at **no cost** (no billing account required, up to **5,000 requests/day per project per product** across GA Workspace MCP servers). High-volume production workloads can upgrade to the **Scaled Tier** by linking a Google Cloud Billing account.
+> - **`/mcp/v1` vs `/mcp/v1self`**: `/mcp/v1` exposes the full toolset (supporting server-driven HITL form elicitation). For headless or non-interactive clients that do not implement form-mode elicitation UIs, `/mcp/v1self` provides a self-mode fallback toolset.
+> - **Workspace Admin Controls**: For Google Workspace organization accounts, administrators can govern OAuth Client IDs, audit logs, DLP policies, and approval workflows under **Admin Console → Security → API Controls**.
+
+#### Step-by-Step Installation & Setup Guide
+
+1. **Create a GAS Project & Add the GASADK Library**
+   - Open [script.google.com](https://script.google.com/) and create a new Apps Script project.
+   - Click **Libraries (+)**, enter Script ID `1w2mwhWQd4_6rom-UBRPD8gayBoqGH_87awSBVqGI8DdaQI_pOeSuGYDu`, select the latest version (**v2.1.0+**), and set the Identifier to `GASADK`.
+   - Under **Project Settings → Script Properties**, add `GEMINI_API_KEY` with your Gemini API key.
+
+2. **Link Your Apps Script Project to a Standard Google Cloud Project**
+   - Default Apps Script Cloud projects cannot manually enable `*mcp.googleapis.com` services. You must link a **Standard Google Cloud Project** ([Official Guide](https://developers.google.com/apps-script/guides/cloud-platform-projects)):
+     1. In the Apps Script editor, open **Project Settings** (gear icon).
+     2. Under **Google Cloud Project**, click **Change project**.
+     3. Enter your standard Google Cloud **Project Number** and click **Set project**.
+     *(Note: Switching to a standard GCP project is irreversible and requires re-authorizing the script.)*
+
+3. **Enable Both the Workspace API and the MCP Service in Google Cloud**
+   - Enable **both** the underlying Workspace API and its companion MCP service on the linked standard Google Cloud project:
+     ```bash
+     # Example for Google Drive MCP Server
+     gcloud services enable --project=YOUR_PROJECT_ID \
+       drive.googleapis.com \
+       drivemcp.googleapis.com
+     ```
+   - Or via **Google Cloud Console → APIs & Services → Library**: search for and enable both **Google Drive API** (`drive.googleapis.com`) and **Google Drive MCP API** (`drivemcp.googleapis.com`).
+
+4. **Configure `appsscript.json` Manifest & OAuth Scopes**
+   - In Apps Script **Project Settings**, check **"Show 'appsscript.json' manifest file in editor"**, then add `oauthScopes` matching least-privilege access ([Official Scopes Guide](https://developers.google.com/apps-script/concepts/scopes)):
+     ```json
+     {
+       "timeZone": "Asia/Tokyo",
+       "dependencies": {
+         "libraries": [
+           {
+             "userSymbol": "GASADK",
+             "version": "4",
+             "libraryId": "1w2mwhWQd4_6rom-UBRPD8gayBoqGH_87awSBVqGI8DdaQI_pOeSuGYDu",
+             "developmentMode": false
+           }
+         ]
+       },
+       "exceptionLogging": "STACKDRIVER",
+       "runtimeVersion": "V8",
+       "oauthScopes": [
+         "https://www.googleapis.com/auth/drive.readonly",
+         "https://www.googleapis.com/auth/script.external_request"
+       ]
+     }
+     ```
+     *(Use `https://www.googleapis.com/auth/drive.readonly` for read-only listing/search, or `https://www.googleapis.com/auth/drive` if your agent also creates or modifies files.)*
+
+5. **Run the Sample Script (`Code.gs`)**
+
+```javascript
+/**
+ * Connects GASADK (v2.1.0+) directly to the official Google Drive MCP Server
+ * using ScriptApp.getOAuthToken() and lists the 5 most recent files.
+ */
+function listRecentDriveFilesWithWorkspaceMcp() {
+  const prompt =
+    "List the 5 most recent files from Google Drive. If an error occurs, display the raw error message.";
+
+  const { LlmAgent } = GASADK;
+  const properties = PropertiesService.getScriptProperties();
+  const apiKey = properties.getProperty("GEMINI_API_KEY");
+  if (!apiKey) {
+    throw new Error("Please set 'GEMINI_API_KEY' in Script Properties.");
+  }
+
+  // Option A: Explicit Google Drive MCP Server configuration
+  const mcpServers = [
+    {
+      drive_mcp: {
+        httpUrl: "https://drivemcp.googleapis.com/mcp/v1", // Or "/mcp/v1self" for self-mode fallback
+        headers: {
+          authorization: "Bearer " + ScriptApp.getOAuthToken(),
+        },
+      },
+    },
+  ];
+  // Option B (Shorthand in v2.1.0+):
+  // const mcpServers = LlmAgent.createWorkspaceMcpServers(["drive"], { mode: "v1" });
+
+  const agent = new LlmAgent({
+    apiKey,
+    name: "GoogleDriveMcpAssistant",
+    // Default model in v2.1.0+ is "models/gemini-4-hydrogen"
+    instruction: "You are a helpful Google Workspace AI assistant.",
+    // Optional: set executionMode: "direct" for ~3.5x faster single-loop MCP execution
+    mcpServers,
+  });
+
+  agent.setServices({
+    lock: LockService.getScriptLock(),
+    properties,
+  });
+
+  const response = agent.run(prompt, (logEntry) => {
+    const detail = logEntry.data?.error ? ` | Error: ${logEntry.data.error}` : "";
+    console.log(`[Log ${logEntry.timestamp}] ${logEntry.message}${detail}`);
+  });
+  console.log(response);
+}
+```
+
 ---
 
 ## License
