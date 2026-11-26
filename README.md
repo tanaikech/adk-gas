@@ -749,9 +749,9 @@ Google's official hosted **Google Workspace MCP servers** are now **Generally Av
          "libraries": [
            {
              "userSymbol": "GASADK",
-             "version": "4",
+             "version": "0",
              "libraryId": "1w2mwhWQd4_6rom-UBRPD8gayBoqGH_87awSBVqGI8DdaQI_pOeSuGYDu",
-             "developmentMode": false
+             "developmentMode": true
            }
          ]
        },
