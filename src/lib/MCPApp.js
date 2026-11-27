@@ -925,12 +925,30 @@ var MCPApp = class MCPApp {
           console.log(compiledMessage);
           break; // Stop sequential pipeline entirely
         } else if (res.handler === "without_function") {
-          const compiledMessage =
-            typeof res.result === "string"
-              ? res.result
-              : JSON.stringify(res.result);
-          generationResults.push(compiledMessage);
-          break; // Stop sequential pipeline entirely
+          let compiledMessage = "";
+          if (typeof res.result === "string") {
+            compiledMessage = res.result;
+          } else if (res.result !== undefined && res.result !== null) {
+            compiledMessage = JSON.stringify(res.result);
+          } else {
+            // Fallback: extract the most recent tool functionResponse from history if model omitted `response`
+            const hist = geminiExecutor.history || [];
+            for (let hi = hist.length - 1; hi >= 0; hi--) {
+              const fr = (hist[hi]?.parts || []).find((pt) => pt && pt.functionResponse);
+              if (fr && fr.functionResponse?.response) {
+                compiledMessage = JSON.stringify(fr.functionResponse.response);
+                break;
+              }
+            }
+          }
+          if (compiledMessage) {
+            generationResults.push(compiledMessage);
+          }
+          // Only halt the entire pipeline when the planned step itself was `without_function`;
+          // for normal tool steps (e.g., update_formulas -> get_values), continue to the next step.
+          if (name === "without_function") {
+            break;
+          }
         }
       } else if (res) {
         console.log(
@@ -958,6 +976,7 @@ var MCPApp = class MCPApp {
     }
 
     let finalOutputs = generationResults.flatMap((output) => {
+      if (output === undefined || output === null || output === "") return [];
       if (output?.type === "text") return output.text;
       if (typeof output === "string") return output;
       if (output?.data) {
@@ -971,9 +990,10 @@ var MCPApp = class MCPApp {
           `Attachment payload successfully loaded (MIME type: ${output.mimeType}).`,
         ];
       }
-      return [
-        "System Warning: Received a file attachment signature, but content payload was missing.",
-      ];
+      if (typeof output === "object") {
+        return [JSON.stringify(output)];
+      }
+      return [String(output)];
     });
 
     const standardTextResults = finalOutputs.filter(
