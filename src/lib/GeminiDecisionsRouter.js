@@ -146,8 +146,8 @@ var GeminiDecisionsRouter =
               max_capability_override: {
                 default: { tier: "frontierFast", thinkingLevel: "MEDIUM" },
                 withTools: { tier: "frontierFast", thinkingLevel: "MEDIUM" },
-                synthesizer: { tier: "frontierMax", thinkingLevel: "HIGH" },
-                direct: { tier: "frontierMax", thinkingLevel: "HIGH" },
+                synthesizer: { tier: "frontierMax", thinkingLevel: "MEDIUM" },
+                direct: { tier: "frontierMax", thinkingLevel: "MEDIUM" },
               },
             },
             quality: {
@@ -171,14 +171,14 @@ var GeminiDecisionsRouter =
               frontier: {
                 default: { tier: "frontierFast", thinkingLevel: "MEDIUM" },
                 withTools: { tier: "frontierFast", thinkingLevel: "MEDIUM" },
-                synthesizer: { tier: "frontierMax", thinkingLevel: "HIGH" },
-                direct: { tier: "frontierMax", thinkingLevel: "HIGH" },
+                synthesizer: { tier: "frontierMax", thinkingLevel: "MEDIUM" },
+                direct: { tier: "frontierMax", thinkingLevel: "MEDIUM" },
               },
               max_capability_override: {
                 default: { tier: "frontierFast", thinkingLevel: "MEDIUM" },
                 withTools: { tier: "frontierFast", thinkingLevel: "MEDIUM" },
-                synthesizer: { tier: "frontierMax", thinkingLevel: "HIGH" },
-                direct: { tier: "frontierMax", thinkingLevel: "HIGH" },
+                synthesizer: { tier: "frontierMax", thinkingLevel: "MEDIUM" },
+                direct: { tier: "frontierMax", thinkingLevel: "MEDIUM" },
               },
             },
           };
