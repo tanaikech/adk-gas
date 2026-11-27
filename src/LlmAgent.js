@@ -296,6 +296,7 @@ var LlmAgent = class LlmAgent {
     if (typeof GeminiDecisionsRouter === "function") {
       const routed = GeminiDecisionsRouter.route({
         apiKey: routedConfig.apiKey || this.apiKey,
+        agentName: this.name,
         prompt: promptForRouting,
         role,
         configuredModel: routedConfig.model || this.model,
@@ -951,7 +952,7 @@ var LlmAgent = class LlmAgent {
           cap._agent.accumulatedTokens = this.accumulatedTokens;
         }
         try {
-          const subRes = cap._agent.run(executionPrompt);
+          const subRes = cap._agent.run(executionPrompt, this._activeRawLogCallback || null);
           if (cap._agent) {
             this.accumulatedTokens = cap._agent.accumulatedTokens;
             if (Array.isArray(cap._agent.routingHistory) && cap._agent.routingHistory.length > 0) {
@@ -1171,6 +1172,7 @@ Instructions:
 
       log("Planning phase initiated.");
       this._activeLogFn = log;
+      this._activeRawLogCallback = logCallback;
       const isFixedRouting =
         typeof GeminiDecisionsRouter !== "function" ||
         GeminiDecisionsRouter.normalizeRoutingConfig(this.modelRouting).mode === "fixed";
@@ -1181,13 +1183,17 @@ Instructions:
       if (isFixedRouting && isThinkingLevelModel && !plannerGenConfig.thinkingConfig) {
         plannerGenConfig.thinkingConfig = { thinkingLevel: "LOW" };
       }
+      // When no capabilities exist, Planner is the sole final answer generator (One-Pass Fast-Track),
+      // so route with role="direct" (enabling frontierMax / gemini-4-carbon HIGH on max_capability_override).
+      const plannerRoutingRole =
+        activeCapabilities && activeCapabilities.length > 0 ? "planner" : "direct";
       const plannerConfig = {
         apiKey: this.apiKey,
         model: this.model,
         history: this.history,
         systemInstruction: { parts: [{ text: globalInstruction }] },
         responseSchema: plannerSchema,
-        _routingRole: "planner",
+        _routingRole: plannerRoutingRole,
         _routingPrompt: prompt,
         ...(Object.keys(plannerGenConfig).length > 0
           ? { generationConfig: plannerGenConfig }

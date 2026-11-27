@@ -552,7 +552,7 @@ var GeminiDecisionsRouter =
           return { model, level, guardReason };
         }
 
-        static buildBoundedInput(prompt, role, hasTools, maxInputChars = 3000) {
+        static buildBoundedInput(prompt, maxInputChars = 3000) {
           const cap = Math.max(256, Number(maxInputChars) || 3000);
           let raw = "";
           if (typeof prompt === "string") {
@@ -569,15 +569,12 @@ var GeminiDecisionsRouter =
           raw = raw.replace(/[A-Za-z0-9+/]{512,}={0,2}/g, "[LARGE_BLOB_OMITTED]");
           raw = raw.trim();
 
-          const header = `[Role: ${role || "default"} | Tools: ${hasTools ? "yes" : "no"}]\n`;
-          const avail = Math.max(128, cap - header.length);
-          if (raw.length <= avail) {
-            return header + raw;
+          if (raw.length <= cap) {
+            return raw || "(empty prompt)";
           }
-          const headLen = Math.floor(avail * 0.65);
-          const tailLen = Math.max(32, avail - headLen - 20);
+          const headLen = Math.floor(cap * 0.65);
+          const tailLen = Math.max(32, cap - headLen - 20);
           return (
-            header +
             raw.slice(0, headLen) +
             "\n...[TRUNCATED]...\n" +
             raw.slice(raw.length - tailLen)
@@ -697,12 +694,13 @@ var GeminiDecisionsRouter =
 
         static formatLogMessage(decision) {
           const d = decision || {};
+          const agentPart = d.agent ? `agent=${d.agent} | ` : "";
           const thinkLabel = d.thinkingLevel || "default";
           const msPart =
             typeof d.decisionsLatencyMs === "number" && d.decisionsLatencyMs >= 0
               ? ` (decisions=${d.decisionsLatencyMs}ms)`
               : "";
-          return `[ModelRouting] role=${d.role || "default"} | mode=${d.mode || "fixed"} | model=${d.model} | thinking=${thinkLabel} | reason=${d.reason || "configured"}${msPart}`;
+          return `[ModelRouting] ${agentPart}role=${d.role || "default"} | mode=${d.mode || "fixed"} | model=${d.model} | thinking=${thinkLabel} | reason=${d.reason || "configured"}${msPart}`;
         }
 
         /**
@@ -712,6 +710,7 @@ var GeminiDecisionsRouter =
         static route(params = {}) {
           GeminiDecisionsRouter._ensureRegistry();
           const cfg = GeminiDecisionsRouter.normalizeRoutingConfig(params.modelRouting);
+          const agentName = params.agentName || null;
           const role = params.role || "default";
           const hasTools = Boolean(params.hasTools);
           const configuredModel = GeminiDecisionsRouter.normalizeModelName(
@@ -747,6 +746,7 @@ var GeminiDecisionsRouter =
               { allowXHighInGas: cfg.allowXHighInGas },
             );
             return emitAndReturn(configuredModel, norm.generationConfig, {
+              agent: agentName,
               role,
               mode: "fixed",
               model: configuredModel,
@@ -772,6 +772,7 @@ var GeminiDecisionsRouter =
               { allowXHighInGas: cfg.allowXHighInGas },
             );
             return emitAndReturn(configuredModel, norm.generationConfig, {
+              agent: agentName,
               role,
               mode: cfg.mode,
               model: configuredModel,
@@ -788,11 +789,11 @@ var GeminiDecisionsRouter =
 
           const boundedInput = GeminiDecisionsRouter.buildBoundedInput(
             params.prompt,
-            role,
-            hasTools,
             cfg.maxInputChars,
           );
-          const cacheKey = `${cfg.mode}|${role}|${hasTools ? 1 : 0}|${cfg.billingTier}|${params.forceMaxCapability ? 1 : 0}|${GeminiDecisionsRouter._hashString(boundedInput)}`;
+          // Key Decisions evaluation cache strictly by (decisionModel, promptHash) so
+          // Planner -> Synthesizer and previewModelRouting() reuse a single Decisions API call.
+          const cacheKey = `${cfg.decisionModel}|${GeminiDecisionsRouter._hashString(boundedInput)}`;
 
           let evalResult = null;
           let cacheHit = false;
@@ -821,6 +822,7 @@ var GeminiDecisionsRouter =
                 { allowXHighInGas: cfg.allowXHighInGas },
               );
               return emitAndReturn(configuredModel, norm.generationConfig, {
+                agent: agentName,
                 role,
                 mode: cfg.mode,
                 model: configuredModel,
@@ -884,6 +886,7 @@ var GeminiDecisionsRouter =
           if (cacheHit) reason += " [cached]";
 
           return emitAndReturn(guarded.model, norm.generationConfig, {
+            agent: agentName,
             role,
             mode: cfg.mode,
             model: guarded.model,
