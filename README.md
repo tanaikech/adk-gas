@@ -940,6 +940,68 @@ function listRecentDriveFilesWithWorkspaceMcp() {
 }
 ```
 
+### 9. Testing Dynamic Model & Thinking Routing (v2.1.1+)
+
+The concise single-function script below lets you verify all **GASADK v2.1.1** routing features—JSON mode comparison (`getModelRoutingConfig()`), 1-call dry-run preview (`previewModelRouting()`), `efficient` vs `fixed` live execution, explicit maximum-capability auto-escalation, live `[ModelRouting]` logs, and external future-model customization—directly in the Apps Script editor:
+
+```javascript
+/**
+ * Simple one-shot verification script for GASADK v2.1.1 Dynamic Model & Thinking Routing.
+ * Requires Script Property "GEMINI_API_KEY".
+ */
+function testDynamicModelRoutingV211() {
+  const { LlmAgent } = GASADK;
+  const properties = PropertiesService.getScriptProperties();
+  const apiKey = properties.getProperty("GEMINI_API_KEY");
+  const lock = LockService.getScriptLock();
+  if (!apiKey) throw new Error("Set 'GEMINI_API_KEY' in Script Properties.");
+
+  const agent = new LlmAgent({
+    apiKey,
+    name: "RoutingDemoAgent",
+    modelRouting: "efficient", // "efficient" (default) | "quality" | "fixed"
+  }).setServices({ lock, properties });
+
+  // 1. Export & compare fixed / efficient / quality settings as JSON (0 API calls)
+  console.log("=== 1. Config Comparison JSON ===");
+  console.log(JSON.stringify(agent.getModelRoutingConfig().modeComparison, null, 2));
+
+  // 2. Dry-run preview for a prompt (1 Decisions API call, 0 content generation)
+  console.log("=== 2. Dry-Run Preview ===");
+  console.log(
+    JSON.stringify(
+      agent.previewModelRouting("Use maximum capability to design a distributed cache."),
+      null,
+      2,
+    ),
+  );
+
+  // 3. Live run: simple prompt (auto-routed to fast/lite model with [ModelRouting] log)
+  console.log("=== 3. Live Efficient Run (Trivial) ===");
+  const fastAnswer = agent.run("What is 17 * 23? Reply with the number only.", (logEntry) => {
+    if (logEntry.message.includes("[ModelRouting]")) console.log(logEntry.message);
+  });
+  console.log("Answer:", fastAnswer);
+
+  // 4. Live run: explicit max-capability prompt (auto-escalates to frontier model)
+  console.log("=== 4. Live Efficient Run (Max Capability Escalation) ===");
+  const deepAnswer = agent.run(
+    "Use maximum capability to list 3 design rules for avoiding GAS 6-minute timeouts.",
+    (logEntry) => {
+      if (logEntry.message.includes("[ModelRouting]")) console.log(logEntry.message);
+    },
+  );
+  console.log("Answer:", deepAnswer);
+
+  // 5. Inspect structured routing history
+  console.log("=== 5. Routing History ===");
+  console.log(JSON.stringify(agent.getRoutingHistory(), null, 2));
+}
+```
+
+> [!TIP]
+> For a full 8-case automated live benchmark (including `fixed` vs `efficient` speedup measurement, `quality` mode with Native Tools, `SubAgent` inheritance, and future-model registration round-trip), see [tests/Test_GASADK_v2_1_1_DecisionsRouter_E2E.js](tests/Test_GASADK_v2_1_1_DecisionsRouter_E2E.js) (`runAllGasadkV211RoutingTests()`).
+
 ---
 
 ## 🛡 Hooks System & Workspace Safety Guardrails (v1.3.5+)
