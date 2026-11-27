@@ -4,8 +4,8 @@
  * Author: Kanshi Tanaike
  * https://github.com/tanaikech/FileSearchApp
  *
- * Updated on 20251113 1048
- * version 1.0.0
+ * Updated on 20261127
+ * version 1.1.0 (Gemini Decisions API Dynamic Model & Thinking Routing)
  */
 
 /**
@@ -46,13 +46,20 @@ var FileSearch = class FileSearch {
    */
   constructor({
     apiKey,
-    model = "models/gemini-4-hydrogen" /** or models/gemini-2.5-pro */,
+    model = "models/gemini-4-hydrogen",
+    modelRouting = "efficient",
+    generationConfig = null,
+    onRoutingLog = null,
   }) {
     if (!apiKey) {
       throw new Error("API key is required.");
     }
     this.apiKey = apiKey;
     this.model = model;
+    this.modelRouting = modelRouting !== undefined ? modelRouting : "efficient";
+    this.generationConfig = generationConfig || null;
+    this.onRoutingLog = typeof onRoutingLog === "function" ? onRoutingLog : null;
+    this._lastRoutingDecision = null;
 
     // Define base URLs as instance properties
     this.apiBaseUrl = "https://generativelanguage.googleapis.com/v1beta";
@@ -522,8 +529,33 @@ var FileSearch = class FileSearch {
     fileSearchStoreNames = [],
     prompt,
     metadataFilter = null,
+    generationConfig = null,
+    modelRouting = undefined,
+    remainingMs = null,
+    forceMaxCapability = false,
   }) {
-    const endpoint = `/${this.model}:generateContent`;
+    let activeModel = this.model;
+    let activeGenConfig = generationConfig || this.generationConfig || null;
+    if (typeof GeminiDecisionsRouter === "function") {
+      const routed = GeminiDecisionsRouter.route({
+        apiKey: this.apiKey,
+        prompt,
+        role: "file_search",
+        configuredModel: this.model,
+        configuredGenerationConfig: activeGenConfig,
+        hasTools: fileSearchStoreNames.length > 0,
+        modelRouting: modelRouting !== undefined ? modelRouting : this.modelRouting,
+        remainingMs,
+        forceMaxCapability,
+        onLog: this.onRoutingLog,
+        consoleLogFallback: !this.onRoutingLog,
+      });
+      activeModel = routed.model;
+      activeGenConfig = routed.generationConfig;
+      this._lastRoutingDecision = routed.routingDecision;
+    }
+    const normModel = activeModel.startsWith("models/") ? activeModel : `models/${activeModel}`;
+    const endpoint = `/${normModel}:generateContent`;
     const tools = [
       {
         fileSearch: {
@@ -535,6 +567,9 @@ var FileSearch = class FileSearch {
     const payload = {
       contents: [{ parts: [{ text: prompt }], role: "user" }],
       ...(fileSearchStoreNames.length > 0 && { tools }),
+      ...(activeGenConfig && Object.keys(activeGenConfig).length > 0
+        ? { generationConfig: activeGenConfig }
+        : {}),
     };
     const response = this._request(endpoint, {
       method: "post",

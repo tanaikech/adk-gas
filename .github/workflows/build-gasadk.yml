@@ -8,6 +8,7 @@ on:
     paths:
       - "src/LlmAgent.js"
       - "src/lib/GasHookManager.js"
+      - "src/lib/GeminiDecisionsRouter.js"
   workflow_dispatch:
 
 env:
@@ -40,6 +41,7 @@ jobs:
           async function main() {
             const files = [
               // Local files are read directly from the filesystem (already checked out)
+              { type: 'local', path: 'src/lib/GeminiDecisionsRouter.js' },
               { type: 'local', path: 'src/lib/GasHookManager.js' },
               { type: 'local', path: 'src/LlmAgent.js' },
               // External files are fetched via HTTPS

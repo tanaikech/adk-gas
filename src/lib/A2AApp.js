@@ -55,7 +55,7 @@ const toLog_ = (kind, text) => {
  *
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.9.0 (Hooks System & Modern Model Update)
+ * Version: 2.10.0 (Gemini Decisions API Dynamic Model & Thinking Routing)
  * GitHub: https://github.com/tanaikech/A2AApp
  * @class
  */
@@ -66,15 +66,31 @@ var A2AApp = class A2AApp {
    * @param {Boolean} [object.log] Enable logging to Google Sheets (default: false).
    * @param {String} [object.spreadsheetId] Spreadsheet ID for logs.
    * @param {String} [object.model] Model name (default: "models/gemini-4-hydrogen").
+   * @param {String|Object} [object.modelRouting] Dynamic Decisions API routing ("efficient" | "quality" | "fixed" | config object).
    */
   constructor(object = {}) {
-    const { accessKey = null, log = false, spreadsheetId, model } = object;
+    const {
+      accessKey = null,
+      log = false,
+      spreadsheetId,
+      model,
+      modelRouting,
+      remainingMs = null,
+      forceMaxCapability = false,
+      onRoutingLog = null,
+    } = object;
 
     /** @private */
     this.accessKey = accessKey;
 
     /** @private */
     this.model = model || "models/gemini-4-hydrogen";
+
+    /** @private */
+    this.modelRouting = modelRouting !== undefined ? modelRouting : "efficient";
+    this.remainingMs = remainingMs;
+    this.forceMaxCapability = Boolean(forceMaxCapability);
+    this.onRoutingLog = typeof onRoutingLog === "function" ? onRoutingLog : null;
 
     /** @private */
     this.jsonrpc = "2.0";
@@ -697,6 +713,13 @@ var A2AApp = class A2AApp {
     const id2 = Utilities.getUuid();
     const id3 = Utilities.getUuid();
 
+    const resolvedRoutingMode =
+      typeof GeminiDecisionsRouter === "function"
+        ? GeminiDecisionsRouter.normalizeRoutingConfig(this.modelRouting).mode
+        : typeof this.modelRouting === "string"
+          ? this.modelRouting
+          : (this.modelRouting && this.modelRouting.mode) || "efficient";
+
     const resObj = {
       jsonrpc: this.jsonrpc,
       id: id1,
@@ -710,6 +733,12 @@ var A2AApp = class A2AApp {
         },
         acceptedOutputModes: ["text", "text/plain"],
         history: history,
+        metadata: {
+          gasadkRouting: {
+            mode: resolvedRoutingMode,
+            maxCapabilityRequested: Boolean(this.forceMaxCapability),
+          },
+        },
       },
     };
 
@@ -1251,6 +1280,12 @@ var A2AApp = class A2AApp {
       model: this.model,
       responseMimeType: "application/json",
       responseSchema,
+      modelRouting: this.modelRouting,
+      routingRole: "a2a_planner",
+      routingPrompt: prompt,
+      remainingMs: this.remainingMs,
+      forceMaxCapability: this.forceMaxCapability,
+      onRoutingLog: this.onRoutingLog,
     });
     if (this.hookManager) g.setHookManager(this.hookManager);
     g.history = [...history, ...(g.history || [])];
@@ -1321,6 +1356,12 @@ var A2AApp = class A2AApp {
         model: this.model,
         functions: funcCall,
         history: tempHistory,
+        modelRouting: this.modelRouting,
+        routingRole: "a2a_executor",
+        routingPrompt: task,
+        remainingMs: this.remainingMs,
+        forceMaxCapability: this.forceMaxCapability,
+        onRoutingLog: this.onRoutingLog,
         toolConfig: {
           functionCallingConfig: { mode: "any", allowedFunctionNames: [name] },
         },
@@ -1583,6 +1624,12 @@ var A2AApp = class A2AApp {
           apiKey,
           model: this.model,
           history: tempHistory,
+          modelRouting: this.modelRouting,
+          routingRole: "a2a_synthesizer",
+          routingPrompt: prompt,
+          remainingMs: this.remainingMs,
+          forceMaxCapability: this.forceMaxCapability,
+          onRoutingLog: this.onRoutingLog,
         });
         if (this.hookManager) gg.setHookManager(this.hookManager);
         const res3 = gg.generateContent({

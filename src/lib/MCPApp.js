@@ -2,8 +2,8 @@
  * Class object for MCP (Model Context Protocol).
  * Author: Kanshi Tanaike
  * Refactored by: Senior Generative AI & MCP Expert
- * Version: 2.4.0 (Hooks System & Modern Model Update)
- * Date: 2026-06-10
+ * Version: 2.5.0 (Gemini Decisions API Dynamic Model & Thinking Routing)
+ * Date: 2026-11-27
  * GitHub: https://github.com/tanaikech/MCPApp
  * @class
  */
@@ -14,6 +14,7 @@ var MCPApp = class MCPApp {
    * @param {boolean}[object.log=false] - Default is false. When true, the log between the MCP client and server is stored in Google Sheets.
    * @param {string} [object.spreadsheetId] - Spreadsheet ID. Logs are stored in the "MCP" sheet of this spreadsheet if provided, otherwise "log" sheet.
    * @param {boolean} [object.lock=true] - Default is true. By default, the script runs with LockService to prevent concurrency issues.
+   * @param {string|Object} [object.modelRouting="efficient"] - Dynamic Decisions API model routing ("efficient" | "quality" | "fixed" | config object).
    * @return {MCPApp}
    */
   constructor(object = {}) {
@@ -23,10 +24,20 @@ var MCPApp = class MCPApp {
       spreadsheetId = null,
       lock = true,
       model,
+      modelRouting,
+      remainingMs = null,
+      forceMaxCapability = false,
+      onRoutingLog = null,
     } = object;
 
     /** @private */
     this.model = model || "models/gemini-4-hydrogen";
+
+    /** @private */
+    this.modelRouting = modelRouting !== undefined ? modelRouting : "efficient";
+    this.remainingMs = remainingMs;
+    this.forceMaxCapability = Boolean(forceMaxCapability);
+    this.onRoutingLog = typeof onRoutingLog === "function" ? onRoutingLog : null;
 
     /** @private */
     this.accessKey = accessKey;
@@ -760,12 +771,16 @@ var MCPApp = class MCPApp {
       return raw;
     };
 
+    const isFixedRouting =
+      typeof GeminiDecisionsRouter !== "function" ||
+      GeminiDecisionsRouter.normalizeRoutingConfig(this.modelRouting).mode === "fixed";
     const isThinkingLevelModel = /(?:^|\/)gemini-[34](?:[-.]|$)/i.test(
       this.model,
     );
-    const lowThinkingGenConfig = isThinkingLevelModel
-      ? { generationConfig: { thinkingConfig: { thinkingLevel: "LOW" } } }
-      : {};
+    const lowThinkingGenConfig =
+      isFixedRouting && isThinkingLevelModel
+        ? { generationConfig: { thinkingConfig: { thinkingLevel: "LOW" } } }
+        : {};
 
     const setupObj = {
       apiKey: this.clientObject.apiKey,
@@ -776,6 +791,12 @@ var MCPApp = class MCPApp {
       responseMimeType: "application/json",
       responseSchema,
       exportTotalTokens: true,
+      modelRouting: this.modelRouting,
+      routingRole: "mcp_orchestrator",
+      routingPrompt: this.clientObject.prompt,
+      remainingMs: this.remainingMs,
+      forceMaxCapability: this.forceMaxCapability,
+      onRoutingLog: this.onRoutingLog,
       ...lowThinkingGenConfig,
     };
 
@@ -873,6 +894,12 @@ var MCPApp = class MCPApp {
         },
         history: conversationHistory,
         exportTotalTokens: true,
+        modelRouting: this.modelRouting,
+        routingRole: "mcp_executor",
+        routingPrompt: task,
+        remainingMs: this.remainingMs,
+        forceMaxCapability: this.forceMaxCapability,
+        onRoutingLog: this.onRoutingLog,
         ...lowThinkingGenConfig,
         toolConfig: {
           functionCallingConfig: {
@@ -963,6 +990,12 @@ var MCPApp = class MCPApp {
         model: this.model,
         history: conversationHistory,
         exportTotalTokens: true,
+        modelRouting: this.modelRouting,
+        routingRole: "mcp_summarizer",
+        routingPrompt: this.clientObject.prompt,
+        remainingMs: this.remainingMs,
+        forceMaxCapability: this.forceMaxCapability,
+        onRoutingLog: this.onRoutingLog,
       });
       const finalSummary = unwrapTelemetry(
         geminiSummarizer.generateContent({

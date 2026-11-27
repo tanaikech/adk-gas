@@ -1,6 +1,6 @@
 /**
  * LlmAgent.js
- * [Production Release v2.1.0] - Gemini 4 Hydrogen Edition, Hybrid Direct Mode & Google Workspace MCP Support
+ * [Production Release v2.1.1] - Gemini Decisions API Dynamic Model & Thinking Router Edition
  *
  * @description
  * An elite, highly optimized autonomous orchestrator agent designed specifically for
@@ -80,6 +80,13 @@ var LlmAgent = class LlmAgent {
     this.maxHistoryChars = Number(config.maxHistoryChars || 0);
     this.guardDestructiveMcpTools = Boolean(config.guardDestructiveMcpTools);
     this.useParametersJsonSchema = Boolean(config.useParametersJsonSchema);
+
+    // v2.1.1 Gemini Decisions API Dynamic Model & Thinking Router (default: "efficient")
+    this._explicitModelRouting = config.modelRouting !== undefined;
+    this.modelRouting = config.modelRouting !== undefined ? config.modelRouting : "efficient";
+    this.routingHistory = [];
+    this._turnMaxCapabilityOverride = false;
+    this._activeLogFn = null;
 
     // Capabilities configuration
     this.tools = config.tools || [];
@@ -176,7 +183,95 @@ var LlmAgent = class LlmAgent {
   }
 
   /**
-   * Helper to execute prompt against model, wrapped with BeforeModel and AfterModel hooks.
+   * Exports current model & thinking routing configuration across fixed/efficient/quality modes as JSON (0 API calls).
+   * @returns {Object}
+   */
+  getModelRoutingConfig() {
+    if (typeof GeminiDecisionsRouter !== "function") {
+      return {
+        version: "2.1.1",
+        activeMode: "fixed",
+        configuredModel: this.model,
+        warnings: ["GeminiDecisionsRouter is not loaded; running in fixed mode."],
+      };
+    }
+    return GeminiDecisionsRouter.getRoutingConfigSummary(this.modelRouting, {
+      configuredModel: this.model,
+      configuredGenerationConfig: this.generateContentConfig,
+    });
+  }
+
+  /**
+   * Dry-run preview: calls Decisions API once for a prompt and compares fixed/efficient/quality modes as JSON.
+   * @param {string} prompt
+   * @param {Object} [options={}]
+   * @returns {Object}
+   */
+  previewModelRouting(prompt, options = {}) {
+    if (typeof GeminiDecisionsRouter !== "function") {
+      throw new Error("GeminiDecisionsRouter is required for previewModelRouting().");
+    }
+    return GeminiDecisionsRouter.previewRouting({
+      apiKey: this.apiKey,
+      prompt,
+      role: options.role || "direct",
+      hasTools: options.hasTools !== undefined ? Boolean(options.hasTools) : this.capabilities.length > 0,
+      configuredModel: this.model,
+      configuredGenerationConfig: this.generateContentConfig,
+      modelRouting: this.modelRouting,
+      remainingMs: this._getRemainingMs(),
+    });
+  }
+
+  /**
+   * Returns structured routing decisions logged during this agent's execution.
+   * @returns {Object[]}
+   */
+  getRoutingHistory() {
+    return JSON.parse(JSON.stringify(this.routingHistory || []));
+  }
+
+  static getModelRoutingPresets(customConfig = null, context = {}) {
+    if (typeof GeminiDecisionsRouter !== "function") return null;
+    return GeminiDecisionsRouter.getRoutingConfigSummary(customConfig, context);
+  }
+
+  static configureModelRouting(customConfig = {}) {
+    if (typeof GeminiDecisionsRouter === "function") {
+      GeminiDecisionsRouter.configureDefaults(customConfig);
+    }
+  }
+
+  static registerModels(modelsMap = {}) {
+    if (typeof GeminiDecisionsRouter === "function") {
+      GeminiDecisionsRouter.registerModels(modelsMap);
+    }
+  }
+
+  static resetModelRoutingDefaults() {
+    if (typeof GeminiDecisionsRouter === "function") {
+      GeminiDecisionsRouter.resetDefaults();
+    }
+  }
+
+  _getRemainingMs() {
+    if (!this.startTime || !this.timeoutMs) return null;
+    return Math.max(0, this.timeoutMs - (Date.now() - this.startTime));
+  }
+
+  _recordRoutingLog(msg, decision) {
+    if (decision) {
+      this.routingHistory.push(decision);
+    }
+    if (typeof this._activeLogFn === "function") {
+      this._activeLogFn(msg, decision);
+    } else if (typeof console !== "undefined") {
+      console.log(msg);
+    }
+  }
+
+  /**
+   * Helper to execute prompt against model, wrapped with Decisions API routing, BeforeModel, and AfterModel hooks.
    *
    * @param {Object} config - Gemini configuration object.
    * @param {string} query - The prompt query.
@@ -184,20 +279,70 @@ var LlmAgent = class LlmAgent {
    * @private
    */
   _generateContent(config, query) {
+    let routedConfig = { ...config };
+    let routingDecision = null;
+    const role = config._routingRole || "default";
+    const promptForRouting = config._routingPrompt || query;
+    delete routedConfig._routingRole;
+    delete routedConfig._routingPrompt;
+
+    const hasTools = Boolean(
+      (routedConfig.functions &&
+        routedConfig.functions.params_ &&
+        Object.keys(routedConfig.functions.params_).length > 0) ||
+        (routedConfig.tools && routedConfig.tools.length > 0),
+    );
+
+    if (typeof GeminiDecisionsRouter === "function") {
+      const routed = GeminiDecisionsRouter.route({
+        apiKey: routedConfig.apiKey || this.apiKey,
+        prompt: promptForRouting,
+        role,
+        configuredModel: routedConfig.model || this.model,
+        configuredGenerationConfig: routedConfig.generationConfig || null,
+        hasTools,
+        modelRouting: this.modelRouting,
+        remainingMs: this._getRemainingMs(),
+        forceMaxCapability: this._turnMaxCapabilityOverride,
+        onLog: (msg, dec) => this._recordRoutingLog(msg, dec),
+      });
+      routedConfig.model = routed.model;
+      if (routed.generationConfig && Object.keys(routed.generationConfig).length > 0) {
+        routedConfig.generationConfig = routed.generationConfig;
+      }
+      routingDecision = routed.routingDecision;
+      if (routingDecision?.maxCapabilityOverride) {
+        this._turnMaxCapabilityOverride = true;
+      }
+      if (routingDecision?.decisionsInputTokens) {
+        this.accumulatedTokens =
+          (this.accumulatedTokens || 0) + routingDecision.decisionsInputTokens;
+        if (this.maxTokensPerSession && this.accumulatedTokens > this.maxTokensPerSession) {
+          throw new Error(
+            `CRITICAL: Session aborted. Accumulated token count (${this.accumulatedTokens}) exceeded limit (${this.maxTokensPerSession}).`,
+          );
+        }
+      }
+    }
+
+    const resolvedModel = routedConfig.model || this.model;
+
     // Construct request metadata to pass to BeforeModel
     const beforeResult = this.hookManager.execute("BeforeModel", {
-      config,
+      config: routedConfig,
       query,
       history: this.history || [],
-      model: this.model
+      model: resolvedModel,
+      routingDecision,
     });
 
     if (beforeResult.decision === "deny") {
       throw new Error(`Model request blocked by BeforeModel hook.`);
     }
 
-    const activeConfig = beforeResult.config || config;
+    const activeConfig = beforeResult.config || routedConfig;
     const activeQuery = beforeResult.query || query;
+    const finalModel = activeConfig.model || resolvedModel;
 
     let text;
     // Check if the hook returned a mocked llm_response (allowing API call skip)
@@ -205,10 +350,13 @@ var LlmAgent = class LlmAgent {
     if (mockedResponse && mockedResponse.text !== undefined) {
       text = mockedResponse.text;
     } else {
-      // Force exportTotalTokens to capture token consumption
+      // Force exportTotalTokens to capture token consumption; mark _routingResolved to avoid double routing
       const clientConfig = {
         ...activeConfig,
         exportTotalTokens: true,
+        modelRouting: this.modelRouting,
+        _routingResolved: true,
+        onRoutingLog: (msg, dec) => this._recordRoutingLog(msg, dec),
         ...(this.useParametersJsonSchema &&
         activeConfig.useParametersJsonSchema === undefined
           ? { useParametersJsonSchema: true }
@@ -237,7 +385,8 @@ var LlmAgent = class LlmAgent {
       config: activeConfig,
       query: activeQuery,
       history: this.history || [],
-      model: this.model,
+      model: finalModel,
+      routingDecision,
       text: text
     });
 
@@ -705,11 +854,20 @@ var LlmAgent = class LlmAgent {
           model: this.model,
           functions: funcs,
           history: [...this.history],
+          _routingRole: "executor",
+          _routingPrompt: executionPrompt,
+          ...(this.generateContentConfig ? { generationConfig: { ...this.generateContentConfig } } : {}),
         };
         return this._generateContent(config, executionPrompt);
       }
       case "MCP Server": {
-        const mcpConfig = { model: this.model };
+        const mcpConfig = {
+          model: this.model,
+          modelRouting: this.modelRouting,
+          remainingMs: this._getRemainingMs(),
+          forceMaxCapability: this._turnMaxCapabilityOverride,
+          onRoutingLog: (msg, dec) => this._recordRoutingLog(msg, dec),
+        };
         if (this.logSpreadsheetId) {
           mcpConfig.log = true;
           mcpConfig.spreadsheetId = this.logSpreadsheetId;
@@ -747,8 +905,14 @@ var LlmAgent = class LlmAgent {
         return res?.result || res;
       }
       case "A2A Server": {
-        // [Optimization v1.3.1]: Pass LlmAgent model settings to A2AApp context natively
-        const a2aConfig = { model: this.model };
+        // [Optimization v1.3.1]: Pass LlmAgent model & routing settings to A2AApp context natively
+        const a2aConfig = {
+          model: this.model,
+          modelRouting: this.modelRouting,
+          remainingMs: this._getRemainingMs(),
+          forceMaxCapability: this._turnMaxCapabilityOverride,
+          onRoutingLog: (msg, dec) => this._recordRoutingLog(msg, dec),
+        };
         if (this.logSpreadsheetId) {
           a2aConfig.log = true;
           a2aConfig.spreadsheetId = this.logSpreadsheetId;
@@ -771,11 +935,17 @@ var LlmAgent = class LlmAgent {
         if (typeof cap._agent.setHistory === "function") {
           cap._agent.setHistory([...this.history]);
         }
-        // Inherit parent hooks security context and limits
+        // Inherit parent hooks security context, routing policy, and limits
         if (cap._agent) {
           if (this.hookManager) {
             cap._agent.hookManager = this.hookManager;
             cap._agent.sessionId = this.sessionId;
+          }
+          if (!cap._agent._explicitModelRouting) {
+            cap._agent.modelRouting = this.modelRouting;
+          }
+          if (this._turnMaxCapabilityOverride) {
+            cap._agent._turnMaxCapabilityOverride = true;
           }
           cap._agent.maxTokensPerSession = this.maxTokensPerSession;
           cap._agent.accumulatedTokens = this.accumulatedTokens;
@@ -784,6 +954,9 @@ var LlmAgent = class LlmAgent {
           const subRes = cap._agent.run(executionPrompt);
           if (cap._agent) {
             this.accumulatedTokens = cap._agent.accumulatedTokens;
+            if (Array.isArray(cap._agent.routingHistory) && cap._agent.routingHistory.length > 0) {
+              this.routingHistory.push(...cap._agent.routingHistory);
+            }
           }
           return subRes;
         } catch (err) {
@@ -800,6 +973,9 @@ var LlmAgent = class LlmAgent {
             parts: [{ text: `Strictly apply this skill:\n\n${cap.content}` }],
           },
           history: [...this.history],
+          _routingRole: "executor",
+          _routingPrompt: executionPrompt,
+          ...(this.generateContentConfig ? { generationConfig: { ...this.generateContentConfig } } : {}),
         };
         return this._generateContent(config, executionPrompt);
       }
@@ -809,6 +985,9 @@ var LlmAgent = class LlmAgent {
           model: this.model,
           tools: [cap._tool],
           history: [...this.history],
+          _routingRole: "executor",
+          _routingPrompt: executionPrompt,
+          ...(this.generateContentConfig ? { generationConfig: { ...this.generateContentConfig } } : {}),
         };
         return this._generateContent(config, executionPrompt);
       }
@@ -991,11 +1170,15 @@ Instructions:
 `;
 
       log("Planning phase initiated.");
+      this._activeLogFn = log;
+      const isFixedRouting =
+        typeof GeminiDecisionsRouter !== "function" ||
+        GeminiDecisionsRouter.normalizeRoutingConfig(this.modelRouting).mode === "fixed";
       const isThinkingLevelModel = /(?:^|\/)gemini-[34](?:[-.]|$)/i.test(this.model);
       const plannerGenConfig = this.generateContentConfig
         ? { ...this.generateContentConfig }
         : {};
-      if (isThinkingLevelModel && !plannerGenConfig.thinkingConfig) {
+      if (isFixedRouting && isThinkingLevelModel && !plannerGenConfig.thinkingConfig) {
         plannerGenConfig.thinkingConfig = { thinkingLevel: "LOW" };
       }
       const plannerConfig = {
@@ -1004,6 +1187,8 @@ Instructions:
         history: this.history,
         systemInstruction: { parts: [{ text: globalInstruction }] },
         responseSchema: plannerSchema,
+        _routingRole: "planner",
+        _routingPrompt: prompt,
         ...(Object.keys(plannerGenConfig).length > 0
           ? { generationConfig: plannerGenConfig }
           : {}),
@@ -1283,11 +1468,16 @@ Instructions:
       }
     }
 
+    this._activeLogFn = log;
+    const isFixedDirect =
+      typeof GeminiDecisionsRouter !== "function" ||
+      GeminiDecisionsRouter.normalizeRoutingConfig(this.modelRouting).mode === "fixed";
     const directGenConfig = this.generateContentConfig
       ? { ...this.generateContentConfig }
       : {};
     if (
-      /(?:^|\/)gemini-4(?:[-.]|$)/i.test(this.model) &&
+      isFixedDirect &&
+      /(?:^|\/)gemini-[34](?:[-.]|$)/i.test(this.model) &&
       !directGenConfig.thinkingConfig
     ) {
       directGenConfig.thinkingConfig = { thinkingLevel: "LOW" };
@@ -1299,6 +1489,8 @@ Instructions:
       functions: boundFunctions,
       history: [...this.history],
       systemInstruction: { parts: [{ text: globalInstruction }] },
+      _routingRole: "direct",
+      _routingPrompt: prompt,
       ...(Object.keys(directGenConfig).length > 0
         ? { generationConfig: directGenConfig }
         : {}),
@@ -1383,6 +1575,9 @@ Instructions:
       highestTaskId: this.highestTaskId || 0,
       replanCount: this.replanCount || 0,
       suspendedTask: this.suspendedTask || null,
+      routingSessionState: {
+        maxCapabilityOverride: Boolean(this._turnMaxCapabilityOverride),
+      },
     };
     if (this.services && this.services.properties) {
       const props = this.services.properties;
@@ -1502,12 +1697,16 @@ Instructions:
     this.highestTaskId = stateData.highestTaskId || 0;
     this.replanCount = stateData.replanCount || 0;
     this.suspendedTask = stateData.suspendedTask || null;
+    this._turnMaxCapabilityOverride = Boolean(
+      stateData.routingSessionState && stateData.routingSessionState.maxCapabilityOverride,
+    );
 
     if (this.hookManager) {
       this.hookManager.sessionId = this.sessionId;
     }
 
     const log = this._createLogger(logCallback);
+    this._activeLogFn = log;
 
     log(`Resuming execution for session ${sessionId} with decision: ${approvalDecision}`);
 
@@ -2021,6 +2220,8 @@ Objective:
         model: this.model,
         history: this.history,
         systemInstruction: { parts: [{ text: globalInstruction }] },
+        _routingRole: "synthesizer",
+        _routingPrompt: prompt,
       };
       if (this.outputSchema) synthConfig.responseSchema = this.outputSchema;
       if (this.generateContentConfig)

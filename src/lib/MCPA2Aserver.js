@@ -1,7 +1,7 @@
 /**
  * MCPA2Aserver: Class Object for Consolidating Generative AI Protocols
  * Author: Tanaike
- * v2.3.0 (Hooks System & Modern Model Update)
+ * v2.4.0 (Gemini Decisions API Dynamic Model & Thinking Routing)
  * GitHub: https://github.com/tanaikech/MCPA2Aserver-GAS-Library
  *
  * Refactored Version with Explicit Override, Integrated Sheet Logging, Directional Traffic Tracking,
@@ -63,6 +63,12 @@ var MCPA2Aserver = class MCPA2Aserver {
 
     /** @type {String} Model version to be used for generative AI. */
     this.model = "models/gemini-4-hydrogen";
+
+    /** @type {String|Object} Dynamic Decisions API routing ("efficient" | "quality" | "fixed" | config object). */
+    this.modelRouting = "efficient";
+
+    /** @type {Boolean} Security boundary: opt-in to trust client A2A params.metadata.gasadkRouting hints (default false). */
+    this.allowClientRoutingHints = false;
 
     /** @type {String} Access key to restrict access to the Web Apps. */
     this.accessKey = "";
@@ -773,7 +779,39 @@ var MCPA2Aserver = class MCPA2Aserver {
         agentCardUrls: [],
       };
 
-      const o = { model: this.CONFIG.MODEL };
+      let effectiveRouting = this.modelRouting !== undefined ? this.modelRouting : "efficient";
+      let forceMaxCapability = false;
+      const allowHints =
+        this.allowClientRoutingHints === true ||
+        (effectiveRouting &&
+          typeof effectiveRouting === "object" &&
+          effectiveRouting.allowClientRoutingHints === true);
+      if (allowHints && e && e.postData && e.postData.contents) {
+        try {
+          const parsedReq = JSON.parse(e.postData.contents);
+          const hint = parsedReq?.params?.metadata?.gasadkRouting;
+          if (hint && typeof hint === "object") {
+            const allowedModes = ["efficient", "quality", "fixed"];
+            if (typeof hint.mode === "string" && allowedModes.includes(hint.mode)) {
+              effectiveRouting =
+                typeof effectiveRouting === "object" && effectiveRouting !== null
+                  ? { ...effectiveRouting, mode: hint.mode }
+                  : hint.mode;
+            }
+            if (typeof hint.maxCapabilityRequested === "boolean") {
+              forceMaxCapability = hint.maxCapabilityRequested;
+            }
+          }
+        } catch (_) {
+          // Ignore malformed client hint safely
+        }
+      }
+
+      const o = {
+        model: this.CONFIG.MODEL,
+        modelRouting: effectiveRouting,
+        forceMaxCapability,
+      };
       if (this.accessKey) o.accessKey = this.accessKey;
       if (this.logSpreadsheetId) {
         o.log = true;
